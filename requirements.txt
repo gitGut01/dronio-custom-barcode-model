@@ -5,8 +5,8 @@ opencv-python==4.10.0.84
 albumentations==1.4.21
 pandas==2.2.3
 tqdm==4.67.1
-torch
-torchvision
+#torch
+#torchvision
 mlflow
 # Optional (for GS1 DataBar and other symbologies via BWIPP). Requires Ghostscript installed.
 # treepoem==3.28.0

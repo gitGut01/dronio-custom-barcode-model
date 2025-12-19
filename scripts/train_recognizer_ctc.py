@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 
 import mlflow
 
@@ -243,6 +244,8 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=10, help="Epochs")
     ap.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     ap.add_argument("--device", type=str, default="auto", help="auto|cpu|mps|cuda")
+    ap.add_argument("--tb", action="store_true", help="Enable TensorBoard logging")
+    ap.add_argument("--tb-logdir", type=str, default="runs/barcode-ctc", help="TensorBoard logdir")
     ap.add_argument("--mlflow", action="store_true", help="Enable MLflow tracking")
     ap.add_argument("--mlflow-tracking-uri", type=str, default="", help="MLflow tracking URI (optional)")
     ap.add_argument("--mlflow-experiment", type=str, default="barcode-ctc", help="MLflow experiment name")
@@ -282,6 +285,10 @@ def main() -> None:
         mlflow.set_tracking_uri(args.mlflow_tracking_uri)
     if mlflow_enabled:
         mlflow.set_experiment(args.mlflow_experiment)
+
+    tb_enabled = bool(args.tb)
+    tb_logdir = Path(args.tb_logdir)
+    tb_writer = SummaryWriter(log_dir=str(tb_logdir)) if tb_enabled else None
 
     def _train_and_eval() -> Path:
         for epoch in range(1, args.epochs + 1):
@@ -355,6 +362,12 @@ def main() -> None:
                 mlflow.log_metric("exact_acc", exact_acc, step=epoch)
                 mlflow.log_metric("cer", cer, step=epoch)
 
+            if tb_writer is not None:
+                tb_writer.add_scalar("loss/train", train_loss, epoch)
+                tb_writer.add_scalar("loss/val", val_loss, epoch)
+                tb_writer.add_scalar("metrics/exact_acc", exact_acc, epoch)
+                tb_writer.add_scalar("metrics/cer", cer, epoch)
+
             print(
                 f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} exact={exact_acc:.3f} CER={cer:.3f} vocab={vocab_size_including_blank}"
             )
@@ -369,6 +382,9 @@ def main() -> None:
             },
             out_path,
         )
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
         return out_path
 
     if mlflow_enabled:
@@ -388,6 +404,8 @@ def main() -> None:
 
             out_path = _train_and_eval()
             mlflow.log_artifact(str(out_path))
+            if tb_enabled and tb_logdir.exists():
+                mlflow.log_artifacts(str(tb_logdir), artifact_path="tensorboard")
             print(f"saved: {out_path}")
     else:
         out_path = _train_and_eval()

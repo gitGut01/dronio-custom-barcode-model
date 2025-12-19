@@ -5,6 +5,7 @@ import csv
 import math
 import os
 import random
+import shutil
 import string
 import warnings
 from dataclasses import dataclass
@@ -517,9 +518,15 @@ def parse_symbology_probs(s: str) -> Dict[str, float]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate synthetic 1D barcode dataset")
     ap.add_argument("--out", type=str, default="my_dataset", help="Output directory")
-    ap.add_argument("--train", type=int, default=200, help="Number of training samples")
-    ap.add_argument("--val", type=int, default=20, help="Number of validation samples")
-    ap.add_argument("--test", type=int, default=20, help="Number of test samples")
+    ap.add_argument("--train", type=int, default=20000, help="Number of training samples")
+    ap.add_argument("--val", type=int, default=2000, help="Number of validation samples")
+    ap.add_argument("--test", type=int, default=2000, help="Number of test samples")
+    ap.add_argument(
+        "--zip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Zip the output directory after generation (creates <out>.zip)",
+    )
     ap.add_argument("--size-min", type=int, default=80, help="Min side length for generated images")
     ap.add_argument("--size-max", type=int, default=300, help="Max side length for generated images")
     ap.add_argument(
@@ -594,6 +601,17 @@ def main() -> None:
         max_margin_ratio=float(args.max_margin_ratio),
         under_text_prob=float(args.under_text_prob),
     )
+
+    if bool(args.zip):
+        zip_path = out_dir.with_name(out_dir.name + ".zip")
+        if zip_path.exists():
+            zip_path.unlink()
+        shutil.make_archive(
+            base_name=str(zip_path.with_suffix("")),
+            format="zip",
+            root_dir=str(out_dir.parent),
+            base_dir=str(out_dir.name),
+        )
 
 
 if __name__ == "__main__":
