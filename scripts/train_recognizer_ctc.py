@@ -115,6 +115,7 @@ class BarcodeCtcDataset(Dataset):
 def ctc_collate(batch: Sequence[Tuple[torch.Tensor, torch.Tensor, str]]):
     xs, ys, syms = zip(*batch)
 
+    x_w_lens = torch.tensor([x.shape[-1] for x in xs], dtype=torch.long)
     max_w = max(x.shape[-1] for x in xs)
     padded_xs = []
     for x in xs:
@@ -128,7 +129,7 @@ def ctc_collate(batch: Sequence[Tuple[torch.Tensor, torch.Tensor, str]]):
     y_lens = torch.tensor([y.numel() for y in ys], dtype=torch.long)
     y_concat = torch.cat(ys, dim=0) if len(ys) > 0 else torch.empty((0,), dtype=torch.long)
 
-    return x_batch, y_concat, y_lens, list(syms)
+    return x_batch, x_w_lens, y_concat, y_lens, list(syms)
 
 
 class ConvEncoder(nn.Module):
@@ -175,7 +176,7 @@ class CtcRecognizer(nn.Module):
         )
         self.head = nn.Linear(rnn_hidden * 2, vocab_size_including_blank)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, x_w_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: [B, 3, H, W]
         feat = self.encoder(x)  # [B, C, H', W']
         b, c, h, w = feat.shape
@@ -188,7 +189,11 @@ class CtcRecognizer(nn.Module):
 
         # CTC wants [T, B, V]
         log_probs = F.log_softmax(logits, dim=-1).permute(1, 0, 2).contiguous()
-        input_lengths = torch.full((b,), fill_value=log_probs.shape[0], dtype=torch.long, device=log_probs.device)
+        # Encoder downsamples width by 4x (two MaxPool2d(2,2)), so CTC time steps ~= floor(W/4).
+        # Important: use per-sample widths (pre-padding) so padded white area does not count as valid timesteps.
+        x_w_lens = x_w_lens.to(device=log_probs.device)
+        input_lengths = torch.div(x_w_lens, 4, rounding_mode="floor").clamp_min(1)
+        input_lengths = torch.clamp(input_lengths, max=log_probs.shape[0])
         return log_probs, input_lengths
 
 
@@ -296,12 +301,13 @@ def main() -> None:
             model.train()
             total_loss = 0.0
             total_items = 0
-            for xb, y_concat, y_lens, _syms in train_loader:
+            for xb, x_w_lens, y_concat, y_lens, _syms in train_loader:
                 xb = xb.to(device)
+                x_w_lens = x_w_lens.to(device)
                 y_concat = y_concat.to(device)
                 y_lens = y_lens.to(device)
 
-                log_probs, input_lens = model(xb)
+                log_probs, input_lens = model(xb, x_w_lens)
                 loss = ctc(log_probs, y_concat, input_lens, y_lens)
 
                 opt.zero_grad(set_to_none=True)
@@ -323,12 +329,13 @@ def main() -> None:
             n_edits = 0
 
             with torch.no_grad():
-                for xb, y_concat, y_lens, _syms in val_loader:
+                for xb, x_w_lens, y_concat, y_lens, _syms in val_loader:
                     xb = xb.to(device)
+                    x_w_lens = x_w_lens.to(device)
                     y_concat = y_concat.to(device)
                     y_lens = y_lens.to(device)
 
-                    log_probs, input_lens = model(xb)
+                    log_probs, input_lens = model(xb, x_w_lens)
                     loss = ctc(log_probs, y_concat, input_lens, y_lens)
 
                     bs = xb.shape[0]
