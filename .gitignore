@@ -1,0 +1,5 @@
+venv
+my_dataset
+
+.DS_Store
+__pycache__
