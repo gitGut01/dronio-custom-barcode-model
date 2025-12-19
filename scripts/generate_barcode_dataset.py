@@ -406,14 +406,44 @@ def apply_pipeline(
 
     # Albumentations / CV side
     np_img = np.array(pil_img)[:, :, ::-1].copy()  # BGR
-    aug = build_augmentation_pipeline()
-    np_img = aug(image=np_img)["image"]
-    np_img = _grain_and_artifacts(np_img)
+    # aug = build_augmentation_pipeline()
+    # np_img = aug(image=np_img)["image"]
+    # np_img = _grain_and_artifacts(np_img)
 
     # Random final resize to requested output size
-    np_img = cv2.resize(np_img, out_size, interpolation=cv2.INTER_AREA)
+    # np_img = cv2.resize(np_img, out_size, interpolation=cv2.INTER_AREA)
     rgb = cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
+
+
+def _sample_size(
+    size_min: int,
+    size_max: int,
+    landscape_prob: float,
+    aspect_min: float,
+    aspect_max: float,
+) -> Tuple[int, int]:
+    if size_min <= 0 or size_max <= 0:
+        raise ValueError("size_min and size_max must be > 0")
+    if size_min > size_max:
+        raise ValueError("size_min must be <= size_max")
+    if not (0.0 <= landscape_prob <= 1.0):
+        raise ValueError("landscape_prob must be in [0, 1]")
+    if aspect_min < 1.0 or aspect_max < 1.0 or aspect_min > aspect_max:
+        raise ValueError("aspect_min/aspect_max must be >= 1 and aspect_min <= aspect_max")
+
+    base = random.randint(size_min, size_max)
+    aspect = random.uniform(aspect_min, aspect_max)
+    landscape = random.random() < landscape_prob
+
+    if landscape:
+        w = int(round(base * aspect))
+        h = base
+    else:
+        w = base
+        h = int(round(base * aspect))
+
+    return max(96, w), max(96, h)
 
 
 def generate_split(
@@ -426,6 +456,9 @@ def generate_split(
     seed: int,
     max_margin_ratio: float,
     under_text_prob: float,
+    landscape_prob: float,
+    aspect_min: float,
+    aspect_max: float,
 ) -> None:
     images_dir = out_dir / split / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -454,17 +487,13 @@ def generate_split(
             value = _random_value(sym)
             spec = SampleSpec(symbology=sym, value=value)
 
-            # sample canvas size / aspect ratio
-            w = random.randint(size_min, size_max)
-            h = random.randint(size_min, size_max)
-            # allow non-square aspects typical for cameras
-            if random.random() < 0.7:
-                if random.random() < 0.5:
-                    w = int(round(w * random.uniform(1.2, 2.4)))
-                else:
-                    h = int(round(h * random.uniform(1.2, 2.0)))
-
-            canvas_size = (max(96, w), max(96, h))
+            canvas_size = _sample_size(
+                size_min=size_min,
+                size_max=size_max,
+                landscape_prob=landscape_prob,
+                aspect_min=aspect_min,
+                aspect_max=aspect_max,
+            )
 
             # generate and compose
             barcode_img = render_barcode(spec.symbology, spec.value, under_text_prob=under_text_prob)
@@ -474,15 +503,13 @@ def generate_split(
                 max_margin_ratio=max_margin_ratio,
             )
 
-            # final output size (simulate different resolutions)
-            out_w = random.randint(size_min, size_max)
-            out_h = random.randint(size_min, size_max)
-            if random.random() < 0.7:
-                if random.random() < 0.5:
-                    out_w = int(round(out_w * random.uniform(1.2, 2.2)))
-                else:
-                    out_h = int(round(out_h * random.uniform(1.2, 2.0)))
-            out_size = (max(96, out_w), max(96, out_h))
+            out_size = _sample_size(
+                size_min=size_min,
+                size_max=size_max,
+                landscape_prob=landscape_prob,
+                aspect_min=aspect_min,
+                aspect_max=aspect_max,
+            )
 
             final_img = apply_pipeline(composed, bbox=bbox, out_size=out_size)
 
@@ -518,9 +545,9 @@ def parse_symbology_probs(s: str) -> Dict[str, float]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate synthetic 1D barcode dataset")
     ap.add_argument("--out", type=str, default="my_dataset", help="Output directory")
-    ap.add_argument("--train", type=int, default=20000, help="Number of training samples")
-    ap.add_argument("--val", type=int, default=2000, help="Number of validation samples")
-    ap.add_argument("--test", type=int, default=2000, help="Number of test samples")
+    ap.add_argument("--train", type=int, default=200, help="Number of training samples")
+    ap.add_argument("--val", type=int, default=20, help="Number of validation samples")
+    ap.add_argument("--test", type=int, default=20, help="Number of test samples")
     ap.add_argument(
         "--zip",
         action=argparse.BooleanOptionalAction,
@@ -541,11 +568,29 @@ def main() -> None:
         default=0.2,
         help="Max margin as fraction of barcode size (0.5 means margin <= 0.5 * barcode dimension)",
     )
+    ap.add_argument(
+        "--landscape-prob",
+        type=float,
+        default=1.0,
+        help="Probability that generated images are wider than tall",
+    )
+    ap.add_argument(
+        "--aspect-min",
+        type=float,
+        default=1.25,
+        help="Minimum aspect ratio (>=1). With --landscape-prob, controls how wide images tend to be",
+    )
+    ap.add_argument(
+        "--aspect-max",
+        type=float,
+        default=2.0,
+        help="Maximum aspect ratio (>=1). With --landscape-prob, clamps how wide/tall images can get",
+    )
     ap.add_argument("--seed", type=int, default=1337, help="Random seed")
     ap.add_argument(
         "--symbology-probs",
         type=str,
-        default="ean13=1,ean8=1,upca=1,code128=1,code39=1,itf=1,gs1_databar=0.4",
+        default="ean13=1,ean8=1,upca=1,itf=1",
         help="Comma-separated probabilities per symbology",
     )
 
@@ -576,6 +621,9 @@ def main() -> None:
         seed=args.seed + 1,
         max_margin_ratio=float(args.max_margin_ratio),
         under_text_prob=float(args.under_text_prob),
+        landscape_prob=float(args.landscape_prob),
+        aspect_min=float(args.aspect_min),
+        aspect_max=float(args.aspect_max),
     )
     _seed_everything(args.seed + 2)
     generate_split(
@@ -588,6 +636,9 @@ def main() -> None:
         seed=args.seed + 2,
         max_margin_ratio=float(args.max_margin_ratio),
         under_text_prob=float(args.under_text_prob),
+        landscape_prob=float(args.landscape_prob),
+        aspect_min=float(args.aspect_min),
+        aspect_max=float(args.aspect_max),
     )
     _seed_everything(args.seed + 3)
     generate_split(
@@ -600,6 +651,9 @@ def main() -> None:
         seed=args.seed + 3,
         max_margin_ratio=float(args.max_margin_ratio),
         under_text_prob=float(args.under_text_prob),
+        landscape_prob=float(args.landscape_prob),
+        aspect_min=float(args.aspect_min),
+        aspect_max=float(args.aspect_max),
     )
 
     if bool(args.zip):
