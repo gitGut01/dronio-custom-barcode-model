@@ -27,7 +27,8 @@ class Sample:
     value: str
 
 
-DEFAULT_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%/"
+# DEFAULT_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%/"
+DEFAULT_ALPHABET = "0123456789"
 
 
 def build_vocab(samples: Sequence[Sample]) -> Tuple[Dict[str, int], Dict[int, str]]:
