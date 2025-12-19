@@ -4,6 +4,7 @@ import argparse
 import csv
 import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -250,6 +251,9 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=10, help="Epochs")
     ap.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     ap.add_argument("--device", type=str, default="auto", help="auto|cpu|mps|cuda")
+    ap.add_argument("--outdir", type=str, default="checkpoints", help="Directory to write checkpoints")
+    ap.add_argument("--resume", type=str, default="", help="Path to .pt checkpoint to resume training")
+    ap.add_argument("--finetune", type=str, default="", help="Path to .pt checkpoint to finetune (load weights only)")
     ap.add_argument("--tb", action="store_true", help="Enable TensorBoard logging")
     ap.add_argument("--tb-logdir", type=str, default="runs/barcode-ctc", help="TensorBoard logdir")
     ap.add_argument("--mlflow", action="store_true", help="Enable MLflow tracking")
@@ -286,6 +290,46 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)
 
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    def _move_optimizer_state_to_device(device: torch.device) -> None:
+        for state in opt.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device)
+
+    def _load_checkpoint(ckpt_path: Path, *, load_optimizer: bool) -> Tuple[int, float]:
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"], strict=True)
+            if load_optimizer and "optimizer_state_dict" in ckpt:
+                opt.load_state_dict(ckpt["optimizer_state_dict"])
+                _move_optimizer_state_to_device(device)
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            best_val = float(ckpt.get("best_val_loss", math.inf))
+            return start_epoch, best_val
+
+        # Fallback: allow pure state_dict checkpoints
+        if isinstance(ckpt, dict):
+            model.load_state_dict(ckpt, strict=True)
+            return 1, math.inf
+        raise ValueError(f"Unrecognized checkpoint format: {ckpt_path}")
+
+    if args.resume and args.finetune:
+        raise ValueError("Use only one of --resume or --finetune")
+
+    start_epoch = 1
+    best_val_loss = math.inf
+    if args.resume:
+        start_epoch, best_val_loss = _load_checkpoint(Path(args.resume), load_optimizer=True)
+        print(f"resumed from {args.resume} (start_epoch={start_epoch}, best_val_loss={best_val_loss:.6f})")
+    elif args.finetune:
+        start_epoch, _ = _load_checkpoint(Path(args.finetune), load_optimizer=False)
+        start_epoch = 1
+        best_val_loss = math.inf
+        print(f"finetune from {args.finetune} (start_epoch={start_epoch})")
+
     mlflow_enabled = bool(args.mlflow)
     if mlflow_enabled and args.mlflow_tracking_uri:
         mlflow.set_tracking_uri(args.mlflow_tracking_uri)
@@ -297,7 +341,11 @@ def main() -> None:
     tb_writer = SummaryWriter(log_dir=str(tb_logdir)) if tb_enabled else None
 
     def _train_and_eval() -> Path:
-        for epoch in range(1, args.epochs + 1):
+        latest_path = outdir / "latest.pt"
+        best_path = outdir / "best.pt"
+
+        for epoch in range(start_epoch, args.epochs + 1):
+            t0 = time.time()
             model.train()
             total_loss = 0.0
             total_items = 0
@@ -364,6 +412,28 @@ def main() -> None:
             exact_acc = n_exact / max(1, val_items)
             cer = n_edits / max(1, n_chars)
 
+            if val_loss < best_val_loss:
+                best_val_loss = float(val_loss)
+
+            ckpt = {
+                "epoch": int(epoch),
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "best_val_loss": float(best_val_loss),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "exact_acc": float(exact_acc),
+                "cer": float(cer),
+                "char2idx": char2idx,
+                "idx2char": idx2char,
+                "height": int(args.height),
+                "vocab_size_including_blank": int(vocab_size_including_blank),
+            }
+            torch.save(ckpt, latest_path)
+
+            if float(val_loss) == float(best_val_loss):
+                torch.save(ckpt, best_path)
+
             if mlflow_enabled:
                 mlflow.log_metric("train_loss", train_loss, step=epoch)
                 mlflow.log_metric("val_loss", val_loss, step=epoch)
@@ -377,19 +447,10 @@ def main() -> None:
                 tb_writer.add_scalar("metrics/cer", cer, epoch)
 
             print(
-                f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} exact={exact_acc:.3f} CER={cer:.3f} vocab={vocab_size_including_blank}"
+                f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} exact={exact_acc:.3f} CER={cer:.3f} vocab={vocab_size_including_blank} time={(time.time() - t0):.1f}s"
             )
 
-        out_path = Path("ctc_recognizer.pt")
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "char2idx": char2idx,
-                "idx2char": idx2char,
-                "height": args.height,
-            },
-            out_path,
-        )
+        out_path = outdir / "latest.pt"
         if tb_writer is not None:
             tb_writer.flush()
             tb_writer.close()
