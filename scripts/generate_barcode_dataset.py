@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 from tqdm import tqdm
 
+from transformer_model.vocab import code128_alphabet
 
 try:
     import cv2  # type: ignore
@@ -82,6 +83,15 @@ def _alnum(n: int) -> str:
     return "".join(random.choice(alphabet) for _ in range(n))
 
 
+def _code128_chars() -> str:
+    return code128_alphabet()
+
+
+def _code128_random(n: int) -> str:
+    alphabet = _code128_chars()
+    return "".join(random.choice(alphabet) for _ in range(n))
+
+
 def _random_value(sym: str) -> str:
     if sym == "ean13":
         # python-barcode computes checksum if omit last digit, but easiest is provide 12 digits.
@@ -91,7 +101,7 @@ def _random_value(sym: str) -> str:
     if sym == "upca":
         return _digits(11)
     if sym == "code128":
-        return _alnum(random.randint(6, 18))
+        return _code128_random(random.randint(6, 18))
     if sym == "code39":
         # Code39 traditionally supports A-Z 0-9 space - . $ / + %
         alphabet = string.ascii_uppercase + string.digits + "-. $/+%"
@@ -590,7 +600,7 @@ def main() -> None:
     ap.add_argument(
         "--symbology-probs",
         type=str,
-        default="ean13=1,ean8=1,upca=1,itf=1",
+        default="ean13=0.08,ean8=0.06,upca=0.08,itf=0.06,gs1_databar=0.0,code128=0.50,code39=0.20",
         help="Comma-separated probabilities per symbology",
     )
 
