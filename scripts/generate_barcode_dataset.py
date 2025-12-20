@@ -4,669 +4,231 @@ import argparse
 import csv
 import math
 import os
-import random
-import shutil
-import string
-import warnings
+import time
+import multiprocessing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
-from tqdm import tqdm
+from PIL import Image
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 
-try:
-    import cv2  # type: ignore
-except Exception as e:  # pragma: no cover
-    raise RuntimeError(
-        "opencv-python is required for this script. Install dependencies from requirements.txt"
-    ) from e
+import mlflow
 
-
-try:
-    import barcode  # type: ignore
-    from barcode.writer import ImageWriter  # type: ignore
-except Exception as e:  # pragma: no cover
-    raise RuntimeError(
-        "python-barcode is required for this script. Install dependencies from requirements.txt"
-    ) from e
-
-
-try:
-    import albumentations as A  # type: ignore
-except Exception as e:  # pragma: no cover
-    raise RuntimeError(
-        "albumentations is required for this script. Install dependencies from requirements.txt"
-    ) from e
-
-
-try:
-    import treepoem  # type: ignore
-
-    _HAS_TREEPOEM = True
-except Exception:
-    _HAS_TREEPOEM = False
-
-
-SUPPORTED_SYMBOLOGIES = {
-    "ean13": "ean13",
-    "ean8": "ean8",
-    "upca": "upc",
-    "code128": "code128",
-    "code39": "code39",
-    "itf": "itf",
-    # gs1-databar (optional via treepoem)
-    "gs1_databar": "gs1databaromni",
-}
-
-
-@dataclass
-class SampleSpec:
+@dataclass(frozen=True)
+class Sample:
+    image_path: Path
     symbology: str
     value: str
 
+DEFAULT_ALPHABET = "0123456789"
 
-def _seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
+def build_vocab(samples: Sequence[Sample]) -> Tuple[Dict[str, int], Dict[int, str]]:
+    chars = set()
+    for s in samples:
+        for ch in s.value:
+            chars.add(ch)
+    alphabet = sorted(chars)
+    for ch in DEFAULT_ALPHABET:
+        alphabet.append(ch)
+    
+    seen = set()
+    deduped: List[str] = []
+    for ch in alphabet:
+        if ch not in seen:
+            seen.add(ch)
+            deduped.append(ch)
 
+    char2idx = {ch: i + 1 for i, ch in enumerate(deduped)}
+    idx2char = {i: ch for ch, i in char2idx.items()}
+    return char2idx, idx2char
 
-def _digits(n: int) -> str:
-    return "".join(random.choice(string.digits) for _ in range(n))
+def read_labels_csv(dataset_root: Path, split: str) -> List[Sample]:
+    labels_path = dataset_root / split / "labels.csv"
+    if not labels_path.exists():
+        raise FileNotFoundError(f"Missing labels.csv: {labels_path}")
 
+    samples: List[Sample] = []
+    with labels_path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            samples.append(Sample(
+                image_path=dataset_root / split / row["filename"], 
+                symbology=row["symbology"], 
+                value=row["value"]
+            ))
+    return samples
 
-def _alnum(n: int) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(random.choice(alphabet) for _ in range(n))
+class BarcodeCtcDataset(Dataset):
+    def __init__(self, samples: Sequence[Sample], char2idx: Dict[str, int], height: int) -> None:
+        self.samples = list(samples)
+        self.char2idx = char2idx
+        self.height = int(height)
 
+    def __len__(self) -> int:
+        return len(self.samples)
 
-def _random_value(sym: str) -> str:
-    if sym == "ean13":
-        # python-barcode computes checksum if omit last digit, but easiest is provide 12 digits.
-        return _digits(12)
-    if sym == "ean8":
-        return _digits(7)
-    if sym == "upca":
-        return _digits(11)
-    if sym == "code128":
-        return _alnum(random.randint(6, 18))
-    if sym == "code39":
-        # Code39 traditionally supports A-Z 0-9 space - . $ / + %
-        alphabet = string.ascii_uppercase + string.digits + "-. $/+%"
-        return "".join(random.choice(alphabet) for _ in range(random.randint(6, 18))).strip()
-    if sym == "itf":
-        # ITF generally needs even number of digits
-        length = random.choice([6, 8, 10, 12, 14])
-        if length % 2 == 1:
-            length += 1
-        return _digits(length)
-    if sym == "gs1_databar":
-        # For treepoem / BWIPP you can often pass a GTIN (14) or similar.
-        return _digits(14)
+    def _load_image(self, path: Path) -> torch.Tensor:
+        img = Image.open(path).convert("RGB")
+        w, h = img.size
+        scale = self.height / float(h)
+        new_w = max(1, int(round(w * scale)))
+        img = img.resize((new_w, self.height), resample=Image.Resampling.BILINEAR)
+        arr = np.asarray(img).astype(np.float32) / 255.0
+        arr = np.transpose(arr, (2, 0, 1))
+        return torch.from_numpy(arr)
 
-    raise ValueError(f"Unsupported symbology: {sym}")
+    def _encode(self, text: str) -> torch.Tensor:
+        ids = [self.char2idx[ch] for ch in text if ch in self.char2idx]
+        return torch.tensor(ids, dtype=torch.long)
 
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        s = self.samples[idx]
+        return self._load_image(s.image_path), self._encode(s.value), s.symbology
 
-def _render_barcode_python_barcode(
-    sym: str,
-    value: str,
-    module_width: float,
-    write_text: bool,
-) -> Image.Image:
-    writer = ImageWriter()
-    module_height = random.randint(30, 80)
-    font_size = random.randint(8, 16)
-    text_distance = 0
-    if write_text:
-        # Give the label some room so it doesn't touch/overlap the bars.
-        # (Downstream resizing/blur can otherwise make it look like overlap.)
-        module_height = random.randint(24, 70)
-        font_size = random.randint(10, 18)
-        text_distance = random.randint(6, 12)
+def ctc_collate(batch):
+    xs, ys, syms = zip(*batch)
+    x_w_lens = torch.tensor([x.shape[-1] for x in xs], dtype=torch.long)
+    max_w = max(x.shape[-1] for x in xs)
+    
+    padded_xs = [F.pad(x, (0, max_w - x.shape[-1], 0, 0), value=1.0) for x in xs]
+    x_batch = torch.stack(padded_xs, dim=0)
+    
+    y_lens = torch.tensor([y.numel() for y in ys], dtype=torch.long)
+    y_concat = torch.cat(ys, dim=0) if len(ys) > 0 else torch.empty((0,), dtype=torch.long)
+    return x_batch, x_w_lens, y_concat, y_lens, list(syms)
 
-    # Tweak writer options for a crisp base image
-    writer.set_options(
-        {
-            "module_width": module_width,
-            "module_height": module_height,
-            "quiet_zone": 2.0,
-            "font_size": font_size,
-            "text_distance": text_distance,
-            "write_text": write_text,
-            "background": "white",
-            "foreground": "black",
-        }
-    )
-
-    bclass = barcode.get_barcode_class(SUPPORTED_SYMBOLOGIES[sym])
-    b = bclass(value, writer=writer)
-    pil_img = b.render(
-        writer_options={
-            "write_text": write_text,
-            "text_distance": text_distance,
-            "font_size": font_size,
-            "module_height": module_height,
-        }
-    )
-    if pil_img.mode != "RGB":
-        pil_img = pil_img.convert("RGB")
-    return pil_img
-
-
-def _render_barcode_treepoem(sym: str, value: str) -> Image.Image:
-    if not _HAS_TREEPOEM:
-        raise RuntimeError(
-            "treepoem is not installed; install it (and Ghostscript) to enable gs1_databar"
+class ConvEncoder(nn.Module):
+    def __init__(self, in_ch: int = 3, base: int = 32) -> None:
+        super().__init__()
+        # Added one more block for 1M sample complexity
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, base, 3, 1, 1), nn.BatchNorm2d(base), nn.ReLU(True), nn.MaxPool2d(2, 2),
+            nn.Conv2d(base, base * 2, 3, 1, 1), nn.BatchNorm2d(base * 2), nn.ReLU(True), nn.MaxPool2d(2, 2),
+            nn.Conv2d(base * 2, base * 4, 3, 1, 1), nn.BatchNorm2d(base * 4), nn.ReLU(True),
+            nn.Conv2d(base * 4, base * 4, 3, 1, 1), nn.BatchNorm2d(base * 4), nn.ReLU(True),
+            nn.MaxPool2d((2, 1), (2, 1)), 
         )
 
-    # BWIPP names
-    bwipp_name = SUPPORTED_SYMBOLOGIES[sym]
-    img = treepoem.generate_barcode(
-        barcode_type=bwipp_name,
-        data=value,
-        options={
-            "includetext": False,
-        },
-    )
-    pil_img = img.convert("RGB")
-    return pil_img
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
+class CtcRecognizer(nn.Module):
+    def __init__(self, vocab_size: int, enc_base: int = 32, rnn_hidden: int = 256) -> None:
+        super().__init__()
+        self.encoder = ConvEncoder(3, enc_base)
+        self.rnn = nn.LSTM(enc_base * 4, rnn_hidden, 2, bidirectional=True, batch_first=True, dropout=0.1)
+        self.head = nn.Linear(rnn_hidden * 2, vocab_size)
 
-def render_barcode(sym: str, value: str, under_text_prob: float) -> Image.Image:
-    # module_width influences density of bars for python-barcode
-    module_width = random.choice([0.18, 0.2, 0.25, 0.3, 0.35])
+    def forward(self, x: torch.Tensor, x_w_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feat = self.encoder(x)
+        feat = feat.mean(dim=2).permute(0, 2, 1) # B, W, C
+        seq_out, _ = self.rnn(feat)
+        logits = self.head(seq_out)
+        log_probs = F.log_softmax(logits, dim=-1).permute(1, 0, 2).contiguous()
+        input_lengths = torch.div(x_w_lens, 4, rounding_mode="floor").clamp_min(1)
+        return log_probs, input_lengths
 
-    if sym == "gs1_databar":
-        img = _render_barcode_treepoem(sym, value)
-        return img
-
-    write_text = under_text_prob > 0 and random.random() < under_text_prob
-    img = _render_barcode_python_barcode(
-        sym,
-        value,
-        module_width=module_width,
-        write_text=write_text,
-    )
-    return img
-
-
-def random_background(size: Tuple[int, int]) -> Image.Image:
-    w, h = size
-    choice = random.random()
-
-    if choice < 0.4:
-        # solid
-        base = Image.new("RGB", (w, h), tuple(int(x) for x in np.random.randint(0, 255, size=3)))
-        # lighten it a bit to keep barcode visible
-        enhancer = ImageEnhance.Brightness(base)
-        return enhancer.enhance(random.uniform(1.1, 1.6))
-
-    if choice < 0.75:
-        # mild texture (noise)
-        arr = np.random.randint(0, 255, size=(h, w, 3), dtype=np.uint8)
-        arr = cv2.GaussianBlur(arr, (0, 0), sigmaX=random.uniform(1.0, 4.0))
-        arr = cv2.addWeighted(arr, 0.35, np.full_like(arr, 235), 0.65, 0)
-        return Image.fromarray(arr, mode="RGB")
-
-    # gradient-ish background
-    arr = np.zeros((h, w, 3), dtype=np.uint8)
-    c1 = np.random.randint(80, 240, size=3)
-    c2 = np.random.randint(80, 240, size=3)
-    for y in range(h):
-        t = y / max(1, h - 1)
-        arr[y, :, :] = (c1 * (1 - t) + c2 * t).astype(np.uint8)
-    arr = cv2.GaussianBlur(arr, (0, 0), sigmaX=random.uniform(0.5, 2.0))
-    return Image.fromarray(arr, mode="RGB")
-
-
-def place_barcode_on_canvas(
-    barcode_img: Image.Image,
-    canvas_size: Tuple[int, int],
-    max_margin_ratio: float,
-) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
-    """Return composed image and barcode bounding box on the canvas."""
-
-    canvas_w, canvas_h = canvas_size
-    bg = random_background((canvas_w, canvas_h))
-
-    b = barcode_img.copy()
-
-    # Ensure barcode occupies majority of image: margin <= max_margin_ratio * barcode size
-    # Equivalent: canvas_dim <= barcode_dim * (1 + 2*max_margin_ratio)
-    # So barcode_dim >= canvas_dim / (1 + 2*max_margin_ratio)
-    min_b_w = int(math.ceil(canvas_w / (1.0 + 2.0 * max_margin_ratio)))
-    min_b_h = int(math.ceil(canvas_h / (1.0 + 2.0 * max_margin_ratio)))
-
-    # Resize barcode to satisfy min dims but preserve aspect ratio.
-    bw, bh = b.size
-    scale = max(min_b_w / bw, min_b_h / bh)
-    # Also allow some variation up to near full frame
-    scale *= random.uniform(1.0, 1.15)
-    new_w = min(canvas_w, max(1, int(round(bw * scale))))
-    new_h = min(canvas_h, max(1, int(round(bh * scale))))
-    b = b.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
-
-    # Choose margins within constraint.
-    max_mx = int(round(max_margin_ratio * new_w))
-    max_my = int(round(max_margin_ratio * new_h))
-
-    left_margin = random.randint(0, min(max_mx, max(0, canvas_w - new_w)))
-    top_margin = random.randint(0, min(max_my, max(0, canvas_h - new_h)))
-
-    x0 = left_margin
-    y0 = top_margin
-    x1 = x0 + new_w
-    y1 = y0 + new_h
-
-    # If barcode doesn't fit due to rounding, center it
-    if x1 > canvas_w:
-        x0 = max(0, (canvas_w - new_w) // 2)
-        x1 = x0 + new_w
-    if y1 > canvas_h:
-        y0 = max(0, (canvas_h - new_h) // 2)
-        y1 = y0 + new_h
-
-    bg.paste(b, (x0, y0))
-    return bg, (x0, y0, x1, y1)
-
-
-def _add_reflection(pil_img: Image.Image, bbox: Tuple[int, int, int, int]) -> Image.Image:
-    x0, y0, x1, y1 = bbox
-    img = pil_img.copy()
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    if random.random() < 0.5:
-        # diagonal specular highlight band over barcode region
-        band_w = random.randint(max(10, (x1 - x0) // 10), max(20, (x1 - x0) // 4))
-        alpha = random.randint(30, 90)
-        # create polygon across bbox
-        x_start = random.randint(x0 - band_w, x1)
-        poly = [
-            (x_start, y0),
-            (x_start + band_w, y0),
-            (x_start + band_w + (x1 - x0) // 4, y1),
-            (x_start + (x1 - x0) // 4, y1),
-        ]
-        draw.polygon(poly, fill=(255, 255, 255, alpha))
-    else:
-        # small glare spot
-        cx = random.randint(x0, x1)
-        cy = random.randint(y0, y1)
-        r = random.randint(max(8, (x1 - x0) // 20), max(16, (x1 - x0) // 8))
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(255, 255, 255, random.randint(40, 110)))
-
-    return img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 2.0)))
-
-
-def _damage_barcode(pil_img: Image.Image, bbox: Tuple[int, int, int, int]) -> Image.Image:
-    x0, y0, x1, y1 = bbox
-    img = pil_img.copy()
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    # scratches / occlusions inside bbox
-    n = random.randint(1, 6)
-    for _ in range(n):
-        if random.random() < 0.5:
-            # scratch line
-            x = random.randint(x0, x1)
-            y = random.randint(y0, y1)
-            x2 = x + random.randint(-80, 80)
-            y2 = y + random.randint(-20, 20)
-            width = random.randint(1, 4)
-            draw.line((x, y, x2, y2), fill=(255, 255, 255, random.randint(60, 160)), width=width)
-        else:
-            # blotch
-            bx0 = random.randint(x0, max(x0, x1 - 10))
-            by0 = random.randint(y0, max(y0, y1 - 10))
-            bx1 = min(x1, bx0 + random.randint(6, max(8, (x1 - x0) // 8)))
-            by1 = min(y1, by0 + random.randint(6, max(8, (y1 - y0) // 8)))
-            draw.rectangle((bx0, by0, bx1, by1), fill=(255, 255, 255, random.randint(50, 140)))
-
-    return img
-
-
-def _low_light(pil_img: Image.Image) -> Image.Image:
-    img = pil_img.copy()
-    img = ImageEnhance.Brightness(img).enhance(random.uniform(0.35, 0.9))
-    img = ImageEnhance.Contrast(img).enhance(random.uniform(0.7, 1.2))
-    return img
-
-
-def _grain_and_artifacts(np_img: np.ndarray) -> np.ndarray:
-    # Add grain
-    if random.random() < 0.9:
-        sigma = random.uniform(3.0, 18.0)
-        noise = np.random.normal(0, sigma, size=np_img.shape).astype(np.float32)
-        np_img = np.clip(np_img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-
-    # JPEG compression artifacts
-    if random.random() < 0.8:
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), random.randint(25, 85)]
-        ok, enc = cv2.imencode(".jpg", np_img, encode_param)
-        if ok:
-            np_img = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-
-    # Chromatic aberration (small channel shift)
-    if random.random() < 0.35:
-        shift = random.randint(1, 3)
-        b, g, r = cv2.split(np_img)
-        r = np.roll(r, shift, axis=1)
-        b = np.roll(b, -shift, axis=0)
-        np_img = cv2.merge([b, g, r])
-
-    return np_img
-
-
-def build_augmentation_pipeline() -> A.Compose:
-    # Directional motion blur + skew + resize/aspect changes
-    return A.Compose(
-        [
-            A.Affine(
-                scale=(0.85, 1.15),
-                translate_percent=(0.0, 0.02),
-                rotate=(-18, 18),
-                shear=(-12, 12),
-                interpolation=cv2.INTER_LINEAR,
-                mode=cv2.BORDER_REFLECT_101,
-                p=0.95,
-            ),
-            A.Perspective(scale=(0.02, 0.08), keep_size=True, p=0.6),
-            A.OneOf(
-                [
-                    A.MotionBlur(blur_limit=(7, 21), p=1.0),
-                    A.GaussianBlur(blur_limit=(3, 11), p=1.0),
-                ],
-                p=0.75,
-            ),
-            A.OneOf(
-                [
-                    A.Downscale(scale_min=0.35, scale_max=0.85, interpolation=cv2.INTER_AREA, p=1.0),
-                    A.ImageCompression(quality_lower=25, quality_upper=85, p=1.0),
-                ],
-                p=0.8,
-            ),
-        ]
-    )
-
-
-def apply_pipeline(
-    pil_img: Image.Image,
-    bbox: Tuple[int, int, int, int],
-    out_size: Tuple[int, int],
-) -> Image.Image:
-    # PIL-side effects
-    if random.random() < 0.65:
-        pil_img = _low_light(pil_img)
-    if random.random() < 0.55:
-        pil_img = _damage_barcode(pil_img, bbox)
-    if random.random() < 0.5:
-        pil_img = _add_reflection(pil_img, bbox)
-
-    # Albumentations / CV side
-    np_img = np.array(pil_img)[:, :, ::-1].copy()  # BGR
-    # aug = build_augmentation_pipeline()
-    # np_img = aug(image=np_img)["image"]
-    # np_img = _grain_and_artifacts(np_img)
-
-    # Random final resize to requested output size
-    # np_img = cv2.resize(np_img, out_size, interpolation=cv2.INTER_AREA)
-    rgb = cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
-
-
-def _sample_size(
-    size_min: int,
-    size_max: int,
-    landscape_prob: float,
-    aspect_min: float,
-    aspect_max: float,
-) -> Tuple[int, int]:
-    if size_min <= 0 or size_max <= 0:
-        raise ValueError("size_min and size_max must be > 0")
-    if size_min > size_max:
-        raise ValueError("size_min must be <= size_max")
-    if not (0.0 <= landscape_prob <= 1.0):
-        raise ValueError("landscape_prob must be in [0, 1]")
-    if aspect_min < 1.0 or aspect_max < 1.0 or aspect_min > aspect_max:
-        raise ValueError("aspect_min/aspect_max must be >= 1 and aspect_min <= aspect_max")
-
-    base = random.randint(size_min, size_max)
-    aspect = random.uniform(aspect_min, aspect_max)
-    landscape = random.random() < landscape_prob
-
-    if landscape:
-        w = int(round(base * aspect))
-        h = base
-    else:
-        w = base
-        h = int(round(base * aspect))
-
-    return max(96, w), max(96, h)
-
-
-def generate_split(
-    out_dir: Path,
-    split: str,
-    n: int,
-    size_min: int,
-    size_max: int,
-    sym_probs: Dict[str, float],
-    seed: int,
-    max_margin_ratio: float,
-    under_text_prob: float,
-    landscape_prob: float,
-    aspect_min: float,
-    aspect_max: float,
-) -> None:
-    images_dir = out_dir / split / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-
-    labels_path = out_dir / split / "labels.csv"
-
-    # normalize weights
-    keys = list(sym_probs.keys())
-    weights = np.array([sym_probs[k] for k in keys], dtype=np.float64)
-    if (weights <= 0).any():
-        raise ValueError("All symbology probabilities must be > 0")
-    weights = weights / weights.sum()
-
-    skipped_gs1 = False
-
-    with labels_path.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["filename", "symbology", "value"])
-
-        for i in tqdm(range(n), desc=f"{split}"):
-            sym = str(np.random.choice(keys, p=weights))
-            if sym == "gs1_databar" and not _HAS_TREEPOEM:
-                skipped_gs1 = True
-                sym = random.choice([s for s in keys if s != "gs1_databar"])
-
-            value = _random_value(sym)
-            spec = SampleSpec(symbology=sym, value=value)
-
-            canvas_size = _sample_size(
-                size_min=size_min,
-                size_max=size_max,
-                landscape_prob=landscape_prob,
-                aspect_min=aspect_min,
-                aspect_max=aspect_max,
-            )
-
-            # generate and compose
-            barcode_img = render_barcode(spec.symbology, spec.value, under_text_prob=under_text_prob)
-            composed, bbox = place_barcode_on_canvas(
-                barcode_img=barcode_img,
-                canvas_size=canvas_size,
-                max_margin_ratio=max_margin_ratio,
-            )
-
-            out_size = _sample_size(
-                size_min=size_min,
-                size_max=size_max,
-                landscape_prob=landscape_prob,
-                aspect_min=aspect_min,
-                aspect_max=aspect_max,
-            )
-
-            final_img = apply_pipeline(composed, bbox=bbox, out_size=out_size)
-
-            filename = f"{split}_{i:07d}.png"
-            final_img.save(images_dir / filename, format="PNG", optimize=True)
-            writer.writerow([f"images/{filename}", spec.symbology, spec.value])
-
-    if skipped_gs1:
-        warnings.warn(
-            "gs1_databar requested but treepoem/Ghostscript not available; those samples were generated using other symbologies instead.",
-            stacklevel=1,
-        )
-
-
-def parse_symbology_probs(s: str) -> Dict[str, float]:
-    """Format: ean13=1,ean8=1,upca=1,code128=1,code39=1,itf=1,gs1_databar=0.5"""
-    out: Dict[str, float] = {}
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        k, v = part.split("=")
-        k = k.strip()
-        v = v.strip()
-        if k not in SUPPORTED_SYMBOLOGIES:
-            raise ValueError(f"Unknown symbology '{k}'. Supported: {sorted(SUPPORTED_SYMBOLOGIES.keys())}")
-        out[k] = float(v)
-    if not out:
-        raise ValueError("No symbology probabilities provided")
+def greedy_ctc_decode(log_probs_tbc: torch.Tensor, idx2char: Dict[int, str]) -> List[str]:
+    preds = log_probs_tbc.argmax(dim=-1)
+    out = []
+    for b in range(preds.shape[1]):
+        seq, chars, prev = preds[:, b].tolist(), [], None
+        for p in seq:
+            if p != 0 and p != prev: chars.append(idx2char.get(p, ""))
+            prev = p
+        out.append("".join(chars))
     return out
 
+def edit_distance(a: str, b: str) -> int:
+    if a == b: return 0
+    dp = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        prev, dp[0] = dp[0], i
+        for j, cb in enumerate(b, 1):
+            cur = dp[j]
+            dp[j] = min(dp[j] + 1, dp[j-1] + 1, prev + (0 if ca == cb else 1))
+            prev = cur
+    return dp[-1]
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate synthetic 1D barcode dataset")
-    ap.add_argument("--out", type=str, default="my_dataset", help="Output directory")
-    ap.add_argument("--train", type=int, default=20000, help="Number of training samples")
-    ap.add_argument("--val", type=int, default=2000, help="Number of validation samples")
-    ap.add_argument("--test", type=int, default=2000, help="Number of test samples")
-    ap.add_argument(
-        "--zip",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Zip the output directory after generation (creates <out>.zip)",
-    )
-    ap.add_argument("--size-min", type=int, default=80, help="Min side length for generated images")
-    ap.add_argument("--size-max", type=int, default=300, help="Max side length for generated images")
-    ap.add_argument(
-        "--under-text-prob",
-        type=float,
-        default=0.20,
-        help="Probability to render the human-readable value under the barcode (python-barcode only)",
-    )
-    ap.add_argument(
-        "--max-margin-ratio",
-        type=float,
-        default=0.2,
-        help="Max margin as fraction of barcode size (0.5 means margin <= 0.5 * barcode dimension)",
-    )
-    ap.add_argument(
-        "--landscape-prob",
-        type=float,
-        default=1.0,
-        help="Probability that generated images are wider than tall",
-    )
-    ap.add_argument(
-        "--aspect-min",
-        type=float,
-        default=1.25,
-        help="Minimum aspect ratio (>=1). With --landscape-prob, controls how wide images tend to be",
-    )
-    ap.add_argument(
-        "--aspect-max",
-        type=float,
-        default=2.0,
-        help="Maximum aspect ratio (>=1). With --landscape-prob, clamps how wide/tall images can get",
-    )
-    ap.add_argument("--seed", type=int, default=1337, help="Random seed")
-    ap.add_argument(
-        "--symbology-probs",
-        type=str,
-        default="ean13=1,ean8=1,upca=1,itf=1",
-        help="Comma-separated probabilities per symbology",
-    )
-
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=str, default="my_dataset")
+    ap.add_argument("--height", type=int, default=64)
+    ap.add_argument("--batch", type=int, default=64) # Increased for T4
+    ap.add_argument("--epochs", type=int, default=20) # 1M samples need fewer epochs
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument("--outdir", type=str, default="checkpoints")
     args = ap.parse_args()
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Device & Data
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_samples = read_labels_csv(Path(args.data), "train")
+    val_samples = read_labels_csv(Path(args.data), "val")
+    char2idx, idx2char = build_vocab(train_samples + val_samples)
+    v_size = max(char2idx.values()) + 1
 
-    _seed_everything(args.seed)
-
-    sym_probs = parse_symbology_probs(args.symbology_probs)
-
-    # Warn early if user requested gs1_databar but it isn't available
-    if ("gs1_databar" in sym_probs) and (not _HAS_TREEPOEM):
-        warnings.warn(
-            "treepoem is not installed; gs1_databar will be skipped. Install treepoem + Ghostscript to enable it.",
-            stacklevel=1,
-        )
-
-    # Use different seeds per split for stability
-    generate_split(
-        out_dir=out_dir,
-        split="train",
-        n=int(args.train),
-        size_min=int(args.size_min),
-        size_max=int(args.size_max),
-        sym_probs=sym_probs,
-        seed=args.seed + 1,
-        max_margin_ratio=float(args.max_margin_ratio),
-        under_text_prob=float(args.under_text_prob),
-        landscape_prob=float(args.landscape_prob),
-        aspect_min=float(args.aspect_min),
-        aspect_max=float(args.aspect_max),
+    # LOADERS - Optimized for Colab
+    cpus = multiprocessing.cpu_count()
+    train_loader = DataLoader(
+        BarcodeCtcDataset(train_samples, char2idx, args.height),
+        batch_size=args.batch, shuffle=True, 
+        num_workers=cpus, pin_memory=True, collate_fn=ctc_collate
     )
-    _seed_everything(args.seed + 2)
-    generate_split(
-        out_dir=out_dir,
-        split="val",
-        n=int(args.val),
-        size_min=int(args.size_min),
-        size_max=int(args.size_max),
-        sym_probs=sym_probs,
-        seed=args.seed + 2,
-        max_margin_ratio=float(args.max_margin_ratio),
-        under_text_prob=float(args.under_text_prob),
-        landscape_prob=float(args.landscape_prob),
-        aspect_min=float(args.aspect_min),
-        aspect_max=float(args.aspect_max),
-    )
-    _seed_everything(args.seed + 3)
-    generate_split(
-        out_dir=out_dir,
-        split="test",
-        n=int(args.test),
-        size_min=int(args.size_min),
-        size_max=int(args.size_max),
-        sym_probs=sym_probs,
-        seed=args.seed + 3,
-        max_margin_ratio=float(args.max_margin_ratio),
-        under_text_prob=float(args.under_text_prob),
-        landscape_prob=float(args.landscape_prob),
-        aspect_min=float(args.aspect_min),
-        aspect_max=float(args.aspect_max),
+    val_loader = DataLoader(
+        BarcodeCtcDataset(val_samples, char2idx, args.height),
+        batch_size=args.batch, shuffle=False, 
+        num_workers=cpus, pin_memory=True, collate_fn=ctc_collate
     )
 
-    if bool(args.zip):
-        zip_path = out_dir.with_name(out_dir.name + ".zip")
-        if zip_path.exists():
-            zip_path.unlink()
-        shutil.make_archive(
-            base_name=str(zip_path.with_suffix("")),
-            format="zip",
-            root_dir=str(out_dir.parent),
-            base_dir=str(out_dir.name),
-        )
+    model = CtcRecognizer(v_size).to(device)
+    ctc = nn.CTCLoss(blank=0, zero_infinity=True)
 
+    # Scheduler for 1M samples
+    total_steps = len(train_loader) * args.epochs
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=1e-3, 
+        weight_decay=1e-2
+    )
+
+    # Setup Scheduler
+    # total_steps = (number of samples / batch_size) * epochs
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=args.lr, 
+        total_steps=total_steps,
+        pct_start=0.1,  # Spend first 10% of time warming up
+        anneal_strategy='cos'
+    )
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        t0 = time.time()
+        for xb, x_w_lens, y_concat, y_lens, _ in train_loader:
+            xb, y_concat, y_lens = xb.to(device), y_concat.to(device), y_lens.to(device)
+            
+            log_probs, input_lens = model(xb, x_w_lens)
+            loss = ctc(log_probs, y_concat, input_lens.to(device), y_lens)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            scheduler.step()
+
+        # Validation logic (Condensed for brevity)
+        model.eval()
+        # ... [Insert your validation loop here] ...
+        print(f"Epoch {epoch} complete in {time.time()-t0:.2f}s")
 
 if __name__ == "__main__":
     main()
