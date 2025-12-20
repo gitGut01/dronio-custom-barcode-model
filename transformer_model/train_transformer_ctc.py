@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -63,8 +63,8 @@ def main() -> None:
 
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
 
     train_samples = read_labels_csv(Path(args.data), "train")
     val_samples = read_labels_csv(Path(args.data), "val")
@@ -120,7 +120,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
 
     use_amp = bool(args.amp and device.type == "cuda")
-    scaler = GradScaler(enabled=use_amp)
+    scaler = GradScaler(device.type, enabled=use_amp)
 
     total_steps = len(train_loader) * args.epochs
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -155,7 +155,7 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=use_amp):
+            with autocast(device.type, enabled=use_amp):
                 log_probs, input_lens = model(xb, x_w_lens)
                 loss = ctc(log_probs, y_concat, input_lens.to(device), y_lens)
 
@@ -202,7 +202,7 @@ def main() -> None:
                 y_concat = y_concat.to(device, non_blocking=True)
                 y_lens = y_lens.to(device, non_blocking=True)
 
-                with autocast(enabled=use_amp):
+                with autocast(device.type, enabled=use_amp):
                     log_probs, input_lens = model(xb, x_w_lens)
                     loss = ctc(log_probs, y_concat, input_lens.to(device), y_lens)
                 val_loss += loss.item()

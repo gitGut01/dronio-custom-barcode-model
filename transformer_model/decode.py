@@ -1,17 +1,11 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Dict, List
 
 import torch
 
-
-def _log_add_exp(a: float, b: float) -> float:
-    if a == -float("inf"):
-        return b
-    if b == -float("inf"):
-        return a
-    m = a if a > b else b
-    return m + float(torch.log1p(torch.exp(torch.tensor(-abs(a - b), dtype=torch.float32))).item())
+from torchaudio.models.decoder import ctc_decoder
 
 
 def greedy_ctc_decode(log_probs_tbc: torch.Tensor, idx2char: Dict[int, str]) -> List[str]:
@@ -29,6 +23,18 @@ def greedy_ctc_decode(log_probs_tbc: torch.Tensor, idx2char: Dict[int, str]) -> 
     return out
 
 
+@lru_cache(maxsize=32)
+def _get_torchaudio_ctc_decoder(tokens: tuple[str, ...], beam_width: int, blank: int):
+    blank_token = tokens[blank]
+    return ctc_decoder(
+        tokens=list(tokens),
+        lexicon=None,
+        lm=None,
+        blank_token=blank_token,
+        beam_size=beam_width,
+    )
+
+
 def beam_ctc_decode(
     log_probs_tbc: torch.Tensor,
     idx2char: Dict[int, str],
@@ -37,58 +43,43 @@ def beam_ctc_decode(
 ) -> List[str]:
     if log_probs_tbc.dim() != 3:
         raise ValueError("Expected log_probs_tbc to be (T, B, C)")
-    if beam_width <= 0:
-        raise ValueError("beam_width must be positive")
 
-    t, bsz, vocab = log_probs_tbc.shape
+    _, bsz, vocab = log_probs_tbc.shape
     if blank < 0 or blank >= vocab:
         raise ValueError("blank index out of range")
 
+    tokens: List[str] = []
+    for i in range(vocab):
+        if i == blank:
+            tokens.append("<blk>")
+        else:
+            tok = idx2char.get(i, "")
+            tokens.append(tok if tok else f"<{i}>")
+
+    decoder = _get_torchaudio_ctc_decoder(tuple(tokens), beam_width, blank)
+
+    emissions_btc = log_probs_tbc.permute(1, 0, 2).detach().float().cpu()
+    hypos = decoder(emissions_btc)
+
     out: List[str] = []
-    log_probs_tbc = log_probs_tbc.detach().float().cpu()
+    for hlist in hypos:
+        if not hlist:
+            out.append("")
+            continue
 
-    for b in range(bsz):
-        beams: Dict[tuple[int, ...], tuple[float, float]] = {(): (0.0, -float("inf"))}
-        for ti in range(t):
-            lp = log_probs_tbc[ti, b]
-            next_beams: Dict[tuple[int, ...], tuple[float, float]] = {}
+        best = hlist[0]
 
-            def _get(prefix: tuple[int, ...]) -> tuple[float, float]:
-                return next_beams.get(prefix, (-float("inf"), -float("inf")))
+        ids = getattr(best, "tokens", None)
+        if ids is not None:
+            s = "".join(tokens[int(i)] for i in ids if int(i) != blank)
+            out.append(s.replace("<blk>", ""))
+            continue
 
-            for prefix, (p_b, p_nb) in beams.items():
-                p_total = _log_add_exp(p_b, p_nb)
+        words = getattr(best, "words", None)
+        if words is not None:
+            out.append("".join(w for w in words if w != "<blk>"))
+            continue
 
-                p_b2, p_nb2 = _get(prefix)
-                p_b2 = _log_add_exp(p_b2, p_total + float(lp[blank].item()))
-                next_beams[prefix] = (p_b2, p_nb2)
-
-                for c in range(vocab):
-                    if c == blank:
-                        continue
-                    p_c = float(lp[c].item())
-                    end = prefix[-1] if prefix else None
-                    if c == end:
-                        new_prefix = prefix
-                        p_b2, p_nb2 = _get(new_prefix)
-                        p_nb2 = _log_add_exp(p_nb2, p_b + p_c)
-                        next_beams[new_prefix] = (p_b2, p_nb2)
-
-                        new_prefix = prefix + (c,)
-                        p_b2, p_nb2 = _get(new_prefix)
-                        p_nb2 = _log_add_exp(p_nb2, p_nb + p_c)
-                        next_beams[new_prefix] = (p_b2, p_nb2)
-                    else:
-                        new_prefix = prefix + (c,)
-                        p_b2, p_nb2 = _get(new_prefix)
-                        p_nb2 = _log_add_exp(p_nb2, p_total + p_c)
-                        next_beams[new_prefix] = (p_b2, p_nb2)
-
-            beams = dict(
-                sorted(next_beams.items(), key=lambda kv: _log_add_exp(kv[1][0], kv[1][1]), reverse=True)[:beam_width]
-            )
-
-        best = max(beams.items(), key=lambda kv: _log_add_exp(kv[1][0], kv[1][1]))[0]
-        out.append("".join(idx2char.get(i, "") for i in best))
+        out.append("")
 
     return out
