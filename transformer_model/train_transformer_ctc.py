@@ -29,6 +29,8 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--outdir", type=str, default="checkpoints_transformer")
 
+    ap.add_argument("--model-weights", type=str, default="")
+
     ap.add_argument("--enc-base", type=int, default=32)
     ap.add_argument("--d-model", type=int, default=384)
     ap.add_argument("--nhead", type=int, default=8)
@@ -103,6 +105,16 @@ def main() -> None:
         dim_feedforward=args.ff,
         dropout=args.dropout,
     ).to(device)
+
+    if args.model_weights:
+        ckpt = torch.load(args.model_weights, map_location="cpu")
+        state = ckpt.get("model", ckpt)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"--- Loaded checkpoint: {args.model_weights} ---")
+        if missing:
+            print(f"  > Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"  > Unexpected keys: {len(unexpected)}")
 
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
