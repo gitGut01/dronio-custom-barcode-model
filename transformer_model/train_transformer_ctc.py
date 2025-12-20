@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 import mlflow
 
 from transformer_model.data import BarcodeCtcDataset, ctc_collate, read_labels_csv
-from transformer_model.decode import greedy_ctc_decode
+from transformer_model.decode import beam_ctc_decode, greedy_ctc_decode
 from transformer_model.model import TransformerCtcRecognizer
 from transformer_model.vocab import build_vocab_from_alphabet, code128_alphabet
 
@@ -36,6 +36,9 @@ def main() -> None:
     ap.add_argument("--ff", type=int, default=1536)
     ap.add_argument("--dropout", type=float, default=0.1)
 
+    ap.add_argument("--decode", type=str, default="beam", choices=["beam", "greedy"])
+    ap.add_argument("--beam-width", type=int, default=10)
+
     ap.add_argument("--num-workers", type=int, default=4)
 
     ap.add_argument("--amp", action="store_true")
@@ -56,6 +59,11 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     train_samples = read_labels_csv(Path(args.data), "train")
     val_samples = read_labels_csv(Path(args.data), "val")
 
@@ -63,20 +71,26 @@ def main() -> None:
 
     vocab_size = max(char2idx.values()) + 1 if len(char2idx) > 0 else 1
 
+    loader_kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": True,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
     train_loader = DataLoader(
         BarcodeCtcDataset(train_samples, char2idx, args.height),
         batch_size=args.batch,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
         collate_fn=ctc_collate,
     )
     val_loader = DataLoader(
         BarcodeCtcDataset(val_samples, char2idx, args.height),
         batch_size=args.batch,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
         collate_fn=ctc_collate,
     )
 
@@ -123,13 +137,13 @@ def main() -> None:
         step_t0 = time.perf_counter()
 
         for i, (xb, x_w_lens, y_concat, y_lens, _, _) in enumerate(train_loader):
-            xb = xb.to(device)
-            y_concat = y_concat.to(device)
-            y_lens = y_lens.to(device)
+            xb = xb.to(device, non_blocking=True)
+            y_concat = y_concat.to(device, non_blocking=True)
+            y_lens = y_lens.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(device_type=device.type, enabled=use_amp):
+            with autocast(enabled=use_amp):
                 log_probs, input_lens = model(xb, x_w_lens)
                 loss = ctc(log_probs, y_concat, input_lens.to(device), y_lens)
 
@@ -172,18 +186,21 @@ def main() -> None:
             val_t0 = time.perf_counter()
             n_val_imgs = 0
             for xb, x_w_lens, y_concat, y_lens, _, targets in val_loader:
-                xb = xb.to(device)
-                y_concat = y_concat.to(device)
-                y_lens = y_lens.to(device)
+                xb = xb.to(device, non_blocking=True)
+                y_concat = y_concat.to(device, non_blocking=True)
+                y_lens = y_lens.to(device, non_blocking=True)
 
-                with autocast(device_type=device.type, enabled=use_amp):
+                with autocast(enabled=use_amp):
                     log_probs, input_lens = model(xb, x_w_lens)
                     loss = ctc(log_probs, y_concat, input_lens.to(device), y_lens)
                 val_loss += loss.item()
 
                 n_val_imgs += int(xb.size(0))
 
-                preds = greedy_ctc_decode(log_probs, idx2char)
+                if args.decode == "beam":
+                    preds = beam_ctc_decode(log_probs, idx2char, beam_width=args.beam_width, blank=0)
+                else:
+                    preds = greedy_ctc_decode(log_probs, idx2char)
                 for p, t in zip(preds, targets):
                     if p == t:
                         n_exact += 1
