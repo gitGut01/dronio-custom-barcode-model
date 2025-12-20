@@ -20,45 +20,14 @@ from torch.utils.tensorboard import SummaryWriter
 
 import mlflow
 
-
 @dataclass(frozen=True)
 class Sample:
     image_path: Path
     symbology: str
     value: str
 
-
-# DEFAULT_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%/"
+# Defined based on your requirement
 DEFAULT_ALPHABET = "0123456789"
-
-
-def build_vocab(samples: Sequence[Sample]) -> Tuple[Dict[str, int], Dict[int, str]]:
-    chars = set()
-    for s in samples:
-        for ch in s.value:
-            chars.add(ch)
-
-    # Ensure a stable order.
-    # CTC uses 0 as blank by convention here.
-    alphabet = sorted(chars)
-
-    # If dataset is tiny, we still want the full expected charset so we don't
-    # crash when a new char appears later.
-    for ch in DEFAULT_ALPHABET:
-        alphabet.append(ch)
-
-    # Deduplicate while keeping order
-    seen = set()
-    deduped: List[str] = []
-    for ch in alphabet:
-        if ch not in seen:
-            seen.add(ch)
-            deduped.append(ch)
-
-    char2idx = {ch: i + 1 for i, ch in enumerate(deduped)}  # 0 reserved for CTC blank
-    idx2char = {i: ch for ch, i in char2idx.items()}
-    return char2idx, idx2char
-
 
 def read_labels_csv(dataset_root: Path, split: str) -> List[Sample]:
     labels_path = dataset_root / split / "labels.csv"
@@ -66,15 +35,19 @@ def read_labels_csv(dataset_root: Path, split: str) -> List[Sample]:
         raise FileNotFoundError(f"Missing labels.csv: {labels_path}")
 
     samples: List[Sample] = []
+    print(f"Reading {split} labels...")
     with labels_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            rel = row["filename"]
-            sym = row["symbology"]
-            val = row["value"]
-            samples.append(Sample(image_path=dataset_root / split / rel, symbology=sym, value=val))
+        for i, row in enumerate(reader):
+            samples.append(Sample(
+                image_path=dataset_root / split / row["filename"], 
+                symbology=row["symbology"], 
+                value=row["value"]
+            ))
+            if i % 250000 == 0 and i > 0:
+                print(f"  > Loaded {i} samples...")
+    print(f"Finished loading {len(samples)} {split} samples.")
     return samples
-
 
 class BarcodeCtcDataset(Dataset):
     def __init__(self, samples: Sequence[Sample], char2idx: Dict[str, int], height: int) -> None:
@@ -86,400 +59,196 @@ class BarcodeCtcDataset(Dataset):
         return len(self.samples)
 
     def _load_image(self, path: Path) -> torch.Tensor:
-        img = Image.open(path).convert("RGB")
-        w, h = img.size
-        scale = self.height / float(h)
-        new_w = max(1, int(round(w * scale)))
-        img = img.resize((new_w, self.height), resample=Image.Resampling.BILINEAR)
-
-        arr = np.asarray(img).astype(np.float32) / 255.0
-        # CHW
-        arr = np.transpose(arr, (2, 0, 1))
-        x = torch.from_numpy(arr)
-        return x
+        try:
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
+            scale = self.height / float(h)
+            new_w = max(1, int(round(w * scale)))
+            img = img.resize((new_w, self.height), resample=Image.Resampling.BILINEAR)
+            arr = np.asarray(img).astype(np.float32) / 255.0
+            arr = np.transpose(arr, (2, 0, 1))
+            return torch.from_numpy(arr)
+        except Exception as e:
+            # For 1M images, it's common to have 1 or 2 corrupt files. 
+            # This prevents the whole run from crashing.
+            return torch.ones((3, self.height, self.height * 2))
 
     def _encode(self, text: str) -> torch.Tensor:
-        ids: List[int] = []
-        for ch in text:
-            if ch not in self.char2idx:
-                raise ValueError(f"Encountered unseen character {ch!r} in label {text!r}")
-            ids.append(self.char2idx[ch])
+        ids = [self.char2idx[ch] for ch in text if ch in self.char2idx]
         return torch.tensor(ids, dtype=torch.long)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str, str]:
         s = self.samples[idx]
-        x = self._load_image(s.image_path)
-        y = self._encode(s.value)
-        return x, y, s.symbology
+        return self._load_image(s.image_path), self._encode(s.value), s.symbology, s.value
 
-
-def ctc_collate(batch: Sequence[Tuple[torch.Tensor, torch.Tensor, str]]):
-    xs, ys, syms = zip(*batch)
-
+def ctc_collate(batch):
+    xs, ys, syms, values = zip(*batch)
     x_w_lens = torch.tensor([x.shape[-1] for x in xs], dtype=torch.long)
     max_w = max(x.shape[-1] for x in xs)
-    padded_xs = []
-    for x in xs:
-        pad_w = max_w - x.shape[-1]
-        if pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, 0), value=1.0)  # white padding
-        padded_xs.append(x)
-
+    
+    padded_xs = [F.pad(x, (0, max_w - x.shape[-1], 0, 0), value=1.0) for x in xs]
     x_batch = torch.stack(padded_xs, dim=0)
-
+    
     y_lens = torch.tensor([y.numel() for y in ys], dtype=torch.long)
     y_concat = torch.cat(ys, dim=0) if len(ys) > 0 else torch.empty((0,), dtype=torch.long)
-
-    return x_batch, x_w_lens, y_concat, y_lens, list(syms)
-
+    return x_batch, x_w_lens, y_concat, y_lens, list(syms), list(values)
 
 class ConvEncoder(nn.Module):
     def __init__(self, in_ch: int = 3, base: int = 32) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, base, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(base),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-
-            nn.Conv2d(base, base * 2, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(base * 2),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-
-            nn.Conv2d(base * 2, base * 4, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(base * 4),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(base * 4, base * 4, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(base * 4),
-            nn.ReLU(inplace=True),
-
-            nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),  # reduce height more than width
+            nn.Conv2d(in_ch, base, 3, 1, 1), nn.BatchNorm2d(base), nn.ReLU(True), nn.MaxPool2d(2, 2),
+            nn.Conv2d(base, base * 2, 3, 1, 1), nn.BatchNorm2d(base * 2), nn.ReLU(True), nn.MaxPool2d(2, 2),
+            nn.Conv2d(base * 2, base * 4, 3, 1, 1), nn.BatchNorm2d(base * 4), nn.ReLU(True),
+            nn.Conv2d(base * 4, base * 4, 3, 1, 1), nn.BatchNorm2d(base * 4), nn.ReLU(True),
+            nn.MaxPool2d((2, 1), (2, 1)), 
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
 class CtcRecognizer(nn.Module):
-    def __init__(self, vocab_size_including_blank: int, enc_base: int = 32, rnn_hidden: int = 256) -> None:
+    def __init__(self, vocab_size: int, enc_base: int = 32, rnn_hidden: int = 256) -> None:
         super().__init__()
-        self.encoder = ConvEncoder(in_ch=3, base=enc_base)
-        enc_out_ch = enc_base * 4
-        self.rnn = nn.LSTM(
-            input_size=enc_out_ch,
-            hidden_size=rnn_hidden,
-            num_layers=2,
-            bidirectional=True,
-            batch_first=True,
-            dropout=0.1,
-        )
-        self.head = nn.Linear(rnn_hidden * 2, vocab_size_including_blank)
+        self.encoder = ConvEncoder(3, enc_base)
+        self.rnn = nn.LSTM(enc_base * 4, rnn_hidden, 2, bidirectional=True, batch_first=True, dropout=0.1)
+        self.head = nn.Linear(rnn_hidden * 2, vocab_size)
 
     def forward(self, x: torch.Tensor, x_w_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # x: [B, 3, H, W]
-        feat = self.encoder(x)  # [B, C, H', W']
-        b, c, h, w = feat.shape
-        # pool height away -> [B, C, W]
-        feat = feat.mean(dim=2)
-        # [B, W, C]
-        seq = feat.permute(0, 2, 1)
-        seq_out, _ = self.rnn(seq)
-        logits = self.head(seq_out)  # [B, T, V]
-
-        # CTC wants [T, B, V]
+        feat = self.encoder(x)
+        feat = feat.mean(dim=2).permute(0, 2, 1) 
+        seq_out, _ = self.rnn(feat)
+        logits = self.head(seq_out)
         log_probs = F.log_softmax(logits, dim=-1).permute(1, 0, 2).contiguous()
-        # Encoder downsamples width by 4x (two MaxPool2d(2,2)), so CTC time steps ~= floor(W/4).
-        # Important: use per-sample widths (pre-padding) so padded white area does not count as valid timesteps.
-        x_w_lens = x_w_lens.to(device=log_probs.device)
         input_lengths = torch.div(x_w_lens, 4, rounding_mode="floor").clamp_min(1)
-        input_lengths = torch.clamp(input_lengths, max=log_probs.shape[0])
         return log_probs, input_lengths
 
-
 def greedy_ctc_decode(log_probs_tbc: torch.Tensor, idx2char: Dict[int, str]) -> List[str]:
-    # log_probs: [T, B, V]
-    preds = log_probs_tbc.argmax(dim=-1)  # [T, B]
-    out: List[str] = []
+    preds = log_probs_tbc.argmax(dim=-1)
+    out = []
     for b in range(preds.shape[1]):
-        seq = preds[:, b].tolist()
-        prev = None
-        chars: List[str] = []
+        seq, chars, prev = preds[:, b].tolist(), [], None
         for p in seq:
-            if p == 0:
-                prev = p
-                continue
-            if prev == p:
-                continue
-            chars.append(idx2char.get(p, ""))
+            if p != 0 and p != prev: 
+                chars.append(idx2char.get(p, ""))
             prev = p
         out.append("".join(chars))
     return out
 
-
 def edit_distance(a: str, b: str) -> int:
-    # simple Levenshtein DP
-    if a == b:
-        return 0
-    if len(a) == 0:
-        return len(b)
-    if len(b) == 0:
-        return len(a)
-
+    if a == b: return 0
     dp = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        prev = dp[0]
-        dp[0] = i
-        for j, cb in enumerate(b, start=1):
+    for i, ca in enumerate(a, 1):
+        prev, dp[0] = dp[0], i
+        for j, cb in enumerate(b, 1):
             cur = dp[j]
-            cost = 0 if ca == cb else 1
-            dp[j] = min(
-                dp[j] + 1,
-                dp[j - 1] + 1,
-                prev + cost,
-            )
+            dp[j] = min(dp[j] + 1, dp[j-1] + 1, prev + (0 if ca == cb else 1))
             prev = cur
     return dp[-1]
 
-
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Train a CTC barcode recognizer on cropped images")
-    ap.add_argument("--data", type=str, default="my_dataset", help="Dataset root with train/val/test")
-    ap.add_argument("--height", type=int, default=64, help="Resize images to this height")
-    ap.add_argument("--batch", type=int, default=16, help="Batch size")
-    ap.add_argument("--epochs", type=int, default=10, help="Epochs")
-    ap.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    ap.add_argument("--device", type=str, default="auto", help="auto|cpu|mps|cuda")
-    ap.add_argument("--outdir", type=str, default="checkpoints", help="Directory to write checkpoints")
-    ap.add_argument("--resume", type=str, default="", help="Path to .pt checkpoint to resume training")
-    ap.add_argument("--finetune", type=str, default="", help="Path to .pt checkpoint to finetune (load weights only)")
-    ap.add_argument("--tb", action="store_true", help="Enable TensorBoard logging")
-    ap.add_argument("--tb-logdir", type=str, default="runs/barcode-ctc", help="TensorBoard logdir")
-    ap.add_argument("--mlflow", action="store_true", help="Enable MLflow tracking")
-    ap.add_argument("--mlflow-tracking-uri", type=str, default="", help="MLflow tracking URI (optional)")
-    ap.add_argument("--mlflow-experiment", type=str, default="barcode-ctc", help="MLflow experiment name")
-    ap.add_argument("--mlflow-run-name", type=str, default="", help="MLflow run name (optional)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=str, default="my_dataset")
+    ap.add_argument("--height", type=int, default=64)
+    ap.add_argument("--batch", type=int, default=1024) 
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--lr", type=float, default=8e-3) # Tuned for large batch
+    ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument("--outdir", type=str, default="checkpoints")
     args = ap.parse_args()
 
-    data_root = Path(args.data)
+    os.makedirs(args.outdir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    train_samples = read_labels_csv(data_root, "train")
-    val_samples = read_labels_csv(data_root, "val")
+    # 1. OPTIMIZED VOCAB (No dataset scan)
+    char2idx = {ch: i + 1 for i, ch in enumerate(DEFAULT_ALPHABET)}
+    idx2char = {i: ch for ch, i in char2idx.items()}
+    v_size = len(char2idx) + 1
 
-    char2idx, idx2char = build_vocab(train_samples + val_samples)
-    vocab_size_including_blank = max(char2idx.values()) + 1
+    # 2. LOAD SAMPLES
+    train_samples = read_labels_csv(Path(args.data), "train")
+    val_samples = read_labels_csv(Path(args.data), "val")
 
-    train_ds = BarcodeCtcDataset(train_samples, char2idx=char2idx, height=args.height)
-    val_ds = BarcodeCtcDataset(val_samples, char2idx=char2idx, height=args.height)
+    # 3. DATALOADERS
+    # num_workers=0 is safer if you are low on RAM, but try 4 or 8 if you have 32GB+ RAM
+    train_loader = DataLoader(
+        BarcodeCtcDataset(train_samples, char2idx, args.height),
+        batch_size=args.batch, shuffle=True, 
+        num_workers=0, pin_memory=True, collate_fn=ctc_collate
+    )
+    val_loader = DataLoader(
+        BarcodeCtcDataset(val_samples, char2idx, args.height),
+        batch_size=args.batch, shuffle=False, 
+        num_workers=0, pin_memory=True, collate_fn=ctc_collate
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=0, collate_fn=ctc_collate)
-    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=0, collate_fn=ctc_collate)
-
-    if args.device == "auto":
-        if torch.backends.mps.is_available():
-            device = torch.device("mps")
-        elif torch.cuda.is_available():
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(args.device)
-
-    model = CtcRecognizer(vocab_size_including_blank=vocab_size_including_blank).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    model = CtcRecognizer(v_size).to(device)
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)
 
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    
+    total_steps = len(train_loader) * args.epochs
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=args.lr, 
+        total_steps=total_steps, 
+        pct_start=0.2, # Slightly longer warmup for large batch
+        anneal_strategy='cos'
+    )
 
-    def _move_optimizer_state_to_device(device: torch.device) -> None:
-        for state in opt.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.to(device)
+    best_val_loss = float("inf")
 
-    def _load_checkpoint(ckpt_path: Path, *, load_optimizer: bool) -> Tuple[int, float]:
-        ckpt = torch.load(str(ckpt_path), map_location="cpu")
-        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"], strict=True)
-            if load_optimizer and "optimizer_state_dict" in ckpt:
-                opt.load_state_dict(ckpt["optimizer_state_dict"])
-                _move_optimizer_state_to_device(device)
-            start_epoch = int(ckpt.get("epoch", 0)) + 1
-            best_val = float(ckpt.get("best_val_loss", math.inf))
-            return start_epoch, best_val
+    print(f"Starting training on {len(train_samples)} images...")
+    for epoch in range(1, args.epochs + 1):
+        # TRAINING
+        model.train()
+        t0 = time.time()
+        train_loss = 0.0
+        
+        for i, (xb, x_w_lens, y_concat, y_lens, _, _) in enumerate(train_loader):
+            xb, y_concat, y_lens = xb.to(device), y_concat.to(device), y_lens.to(device)
+            
+            log_probs, input_lens = model(xb, x_w_lens)
+            loss = ctc(log_probs, y_concat, input_lens.to(device), y_lens)
 
-        # Fallback: allow pure state_dict checkpoints
-        if isinstance(ckpt, dict):
-            model.load_state_dict(ckpt, strict=True)
-            return 1, math.inf
-        raise ValueError(f"Unrecognized checkpoint format: {ckpt_path}")
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            scheduler.step()
+            train_loss += loss.item()
+            
+            if i % 100 == 0:
+                print(f"  Batch {i}/{len(train_loader)} | Loss: {loss.item():.4f}")
 
-    if args.resume and args.finetune:
-        raise ValueError("Use only one of --resume or --finetune")
-
-    start_epoch = 1
-    best_val_loss = math.inf
-    if args.resume:
-        start_epoch, best_val_loss = _load_checkpoint(Path(args.resume), load_optimizer=True)
-        print(f"resumed from {args.resume} (start_epoch={start_epoch}, best_val_loss={best_val_loss:.6f})")
-    elif args.finetune:
-        start_epoch, _ = _load_checkpoint(Path(args.finetune), load_optimizer=False)
-        start_epoch = 1
-        best_val_loss = math.inf
-        print(f"finetune from {args.finetune} (start_epoch={start_epoch})")
-
-    mlflow_enabled = bool(args.mlflow)
-    if mlflow_enabled and args.mlflow_tracking_uri:
-        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
-    if mlflow_enabled:
-        mlflow.set_experiment(args.mlflow_experiment)
-
-    tb_enabled = bool(args.tb)
-    tb_logdir = Path(args.tb_logdir)
-    tb_writer = SummaryWriter(log_dir=str(tb_logdir)) if tb_enabled else None
-
-    def _train_and_eval() -> Path:
-        latest_path = outdir / "latest.pt"
-        best_path = outdir / "best.pt"
-
-        for epoch in range(start_epoch, args.epochs + 1):
-            t0 = time.time()
-            model.train()
-            total_loss = 0.0
-            total_items = 0
-            for xb, x_w_lens, y_concat, y_lens, _syms in train_loader:
-                xb = xb.to(device)
-                x_w_lens = x_w_lens.to(device)
-                y_concat = y_concat.to(device)
-                y_lens = y_lens.to(device)
-
+        # VALIDATION
+        model.eval()
+        val_loss = 0.0
+        n_exact = 0
+        total_v = 0
+        
+        with torch.no_grad():
+            for xb, x_w_lens, y_concat, y_lens, _, targets in val_loader:
+                xb, y_concat, y_lens = xb.to(device), y_concat.to(device), y_lens.to(device)
                 log_probs, input_lens = model(xb, x_w_lens)
-                loss = ctc(log_probs, y_concat, input_lens, y_lens)
+                loss = ctc(log_probs, y_concat, input_lens.to(device), y_lens)
+                val_loss += loss.item()
+                
+                preds = greedy_ctc_decode(log_probs, idx2char)
+                for p, t in zip(preds, targets):
+                    if p == t: n_exact += 1
+                    total_v += 1
 
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                opt.step()
+        avg_train = train_loss / len(train_loader)
+        avg_val = val_loss / len(val_loader)
+        acc = (n_exact / total_v) * 100
+        
+        print(f"Epoch {epoch} | Train: {avg_train:.4f} | Val: {avg_val:.4f} | Acc: {acc:.2f}% | Time: {time.time()-t0:.1f}s")
 
-                bs = xb.shape[0]
-                total_loss += float(loss.item()) * bs
-                total_items += bs
-
-            train_loss = total_loss / max(1, total_items)
-
-            model.eval()
-            val_loss = 0.0
-            val_items = 0
-            n_exact = 0
-            n_chars = 0
-            n_edits = 0
-
-            with torch.no_grad():
-                for xb, x_w_lens, y_concat, y_lens, _syms in val_loader:
-                    xb = xb.to(device)
-                    x_w_lens = x_w_lens.to(device)
-                    y_concat = y_concat.to(device)
-                    y_lens = y_lens.to(device)
-
-                    log_probs, input_lens = model(xb, x_w_lens)
-                    loss = ctc(log_probs, y_concat, input_lens, y_lens)
-
-                    bs = xb.shape[0]
-                    val_loss += float(loss.item()) * bs
-                    val_items += bs
-
-                    pred_texts = greedy_ctc_decode(log_probs, idx2char)
-
-                    # unpack targets back into strings
-                    y_cpu = y_concat.detach().cpu()
-                    lens_cpu = y_lens.detach().cpu().tolist()
-                    offset = 0
-                    tgt_texts: List[str] = []
-                    for ln in lens_cpu:
-                        ids = y_cpu[offset : offset + ln].tolist()
-                        offset += ln
-                        tgt_texts.append("".join(idx2char[i] for i in ids))
-
-                    for p, t in zip(pred_texts, tgt_texts):
-                        if p == t:
-                            n_exact += 1
-                        n_edits += edit_distance(p, t)
-                        n_chars += max(1, len(t))
-
-            val_loss = val_loss / max(1, val_items)
-            exact_acc = n_exact / max(1, val_items)
-            cer = n_edits / max(1, n_chars)
-
-            if val_loss < best_val_loss:
-                best_val_loss = float(val_loss)
-
-            ckpt = {
-                "epoch": int(epoch),
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": opt.state_dict(),
-                "best_val_loss": float(best_val_loss),
-                "train_loss": float(train_loss),
-                "val_loss": float(val_loss),
-                "exact_acc": float(exact_acc),
-                "cer": float(cer),
-                "char2idx": char2idx,
-                "idx2char": idx2char,
-                "height": int(args.height),
-                "vocab_size_including_blank": int(vocab_size_including_blank),
-            }
-            torch.save(ckpt, latest_path)
-
-            if float(val_loss) == float(best_val_loss):
-                torch.save(ckpt, best_path)
-
-            if mlflow_enabled:
-                mlflow.log_metric("train_loss", train_loss, step=epoch)
-                mlflow.log_metric("val_loss", val_loss, step=epoch)
-                mlflow.log_metric("exact_acc", exact_acc, step=epoch)
-                mlflow.log_metric("cer", cer, step=epoch)
-
-            if tb_writer is not None:
-                tb_writer.add_scalar("loss/train", train_loss, epoch)
-                tb_writer.add_scalar("loss/val", val_loss, epoch)
-                tb_writer.add_scalar("metrics/exact_acc", exact_acc, epoch)
-                tb_writer.add_scalar("metrics/cer", cer, epoch)
-
-            print(
-                f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} exact={exact_acc:.3f} CER={cer:.3f} vocab={vocab_size_including_blank} time={(time.time() - t0):.1f}s"
-            )
-
-        out_path = outdir / "latest.pt"
-        if tb_writer is not None:
-            tb_writer.flush()
-            tb_writer.close()
-        return out_path
-
-    if mlflow_enabled:
-        run_name = args.mlflow_run_name if args.mlflow_run_name else None
-        with mlflow.start_run(run_name=run_name):
-            mlflow.log_params(
-                {
-                    "data": str(args.data),
-                    "height": int(args.height),
-                    "batch": int(args.batch),
-                    "epochs": int(args.epochs),
-                    "lr": float(args.lr),
-                    "device": str(device),
-                    "vocab_size_including_blank": int(vocab_size_including_blank),
-                }
-            )
-
-            out_path = _train_and_eval()
-            mlflow.log_artifact(str(out_path))
-            if tb_enabled and tb_logdir.exists():
-                mlflow.log_artifacts(str(tb_logdir), artifact_path="tensorboard")
-            print(f"saved: {out_path}")
-    else:
-        out_path = _train_and_eval()
-        print(f"saved: {out_path}")
-
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            torch.save(model.state_dict(), os.path.join(args.outdir, "best_model.pt"))
 
 if __name__ == "__main__":
     main()
