@@ -58,7 +58,7 @@ def beam_ctc_decode(
 
     decoder = _get_torchaudio_ctc_decoder(tuple(tokens), beam_width, blank)
 
-    emissions_btc = log_probs_tbc.permute(1, 0, 2).detach().float().cpu()
+    emissions_btc = log_probs_tbc.permute(1, 0, 2).detach().float().cpu().contiguous()
     hypos = decoder(emissions_btc)
 
     out: List[str] = []
