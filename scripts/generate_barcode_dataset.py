@@ -16,7 +16,6 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 from tqdm import tqdm
 
-from transformer_model.vocab import code128_alphabet
 
 try:
     import cv2  # type: ignore
@@ -81,6 +80,11 @@ def _digits(n: int) -> str:
 def _alnum(n: int) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(random.choice(alphabet) for _ in range(n))
+
+
+
+def code128_alphabet() -> str:
+    return "".join(chr(i) for i in range(32, 127))
 
 
 def _code128_chars() -> str:
@@ -555,9 +559,9 @@ def parse_symbology_probs(s: str) -> Dict[str, float]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate synthetic 1D barcode dataset")
     ap.add_argument("--out", type=str, default="my_dataset", help="Output directory")
-    ap.add_argument("--train", type=int, default=20000, help="Number of training samples")
-    ap.add_argument("--val", type=int, default=2000, help="Number of validation samples")
-    ap.add_argument("--test", type=int, default=2000, help="Number of test samples")
+    ap.add_argument("--train", type=int, default=200, help="Number of training samples")
+    ap.add_argument("--val", type=int, default=20, help="Number of validation samples")
+    ap.add_argument("--test", type=int, default=20, help="Number of test samples")
     ap.add_argument(
         "--zip",
         action=argparse.BooleanOptionalAction,
@@ -600,7 +604,7 @@ def main() -> None:
     ap.add_argument(
         "--symbology-probs",
         type=str,
-        default="ean13=0.08,ean8=0.06,upca=0.08,itf=0.06,gs1_databar=0.0,code128=0.50,code39=0.20",
+        default="ean13=0.08,ean8=0.06,upca=0.08,itf=0.06,code128=0.50,code39=0.20",
         help="Comma-separated probabilities per symbology",
     )
 
