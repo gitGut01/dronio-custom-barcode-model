@@ -38,7 +38,7 @@ def main() -> None:
     ap.add_argument("--ff", type=int, default=1536)
     ap.add_argument("--dropout", type=float, default=0.1)
 
-    ap.add_argument("--decode", type=str, default="beam", choices=["beam", "greedy"])
+    ap.add_argument("--decode", type=str, default="greedy", choices=["beam", "greedy"])
     ap.add_argument("--beam-width", type=int, default=10)
 
     ap.add_argument("--num-workers", type=int, default=4)
