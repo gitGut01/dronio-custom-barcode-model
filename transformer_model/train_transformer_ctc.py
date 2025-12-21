@@ -57,6 +57,9 @@ def main() -> None:
     ap.add_argument("--outdir", type=str, default="checkpoints_transformer")
 
     ap.add_argument("--model-weights", type=str, default="")
+    ap.add_argument("--resume", type=str, default="")
+
+    ap.add_argument("--scheduler", type=str, default="onecycle", choices=["none", "onecycle", "cosine"])
 
     ap.add_argument("--enc-base", type=int, default=32)
     ap.add_argument("--d-model", type=int, default=384)
@@ -133,15 +136,24 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device)
 
-    if args.model_weights:
-        ckpt = torch.load(args.model_weights, map_location="cpu")
-        state = ckpt.get("model", ckpt)
+    start_epoch = 1
+    global_step = 0
+    resume_ckpt = None
+    resume_path = args.resume or args.model_weights
+    if resume_path:
+        resume_ckpt = torch.load(resume_path, map_location="cpu")
+        state = resume_ckpt.get("model", resume_ckpt)
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"--- Loaded checkpoint: {args.model_weights} ---")
+        print(f"--- Loaded checkpoint: {resume_path} ---")
         if missing:
             print(f"  > Missing keys: {len(missing)}")
         if unexpected:
             print(f"  > Unexpected keys: {len(unexpected)}")
+
+        if args.resume:
+            if isinstance(resume_ckpt, dict):
+                start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
+                global_step = int(resume_ckpt.get("global_step", 0))
 
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
@@ -149,14 +161,52 @@ def main() -> None:
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = GradScaler(device.type, enabled=use_amp)
 
+    if args.resume and isinstance(resume_ckpt, dict):
+        opt_state = resume_ckpt.get("optimizer")
+        if opt_state is not None:
+            try:
+                optimizer.load_state_dict(opt_state)
+                print("--- Restored optimizer state ---")
+            except Exception as e:
+                print(f"--- Failed to restore optimizer state: {e} ---")
+
+        scaler_state = resume_ckpt.get("scaler")
+        if use_amp and scaler_state is not None:
+            try:
+                scaler.load_state_dict(scaler_state)
+                print("--- Restored GradScaler state ---")
+            except Exception as e:
+                print(f"--- Failed to restore GradScaler state: {e} ---")
+
     total_steps = len(train_loader) * args.epochs
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=total_steps,
-        pct_start=0.2,
-        anneal_strategy="cos",
-    )
+    scheduler = None
+    if args.scheduler != "none":
+        last_epoch = int(global_step) - 1
+        if args.scheduler == "onecycle":
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=args.lr,
+                total_steps=total_steps,
+                pct_start=0.2,
+                anneal_strategy="cos",
+                last_epoch=last_epoch,
+            )
+        elif args.scheduler == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps,
+                eta_min=0.0,
+                last_epoch=last_epoch,
+            )
+
+        if args.resume and isinstance(resume_ckpt, dict):
+            sched_state = resume_ckpt.get("scheduler")
+            if sched_state is not None:
+                try:
+                    scheduler.load_state_dict(sched_state)
+                    print("--- Restored scheduler state ---")
+                except Exception as e:
+                    print(f"--- Failed to restore scheduler state: {e} ---")
 
     tb_logdir = None
     if args.tb:
@@ -173,7 +223,7 @@ def main() -> None:
 
     best_val_loss = float("inf")
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         t0 = time.time()
         train_loss = 0.0
@@ -196,7 +246,10 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
+
+            global_step += 1
 
             train_loss += loss.item()
             if args.log_interval > 0 and i % args.log_interval == 0:
@@ -211,14 +264,12 @@ def main() -> None:
                 )
 
                 if writer:
-                    global_step = (epoch - 1) * len(train_loader) + i
                     writer.add_scalar("LR/Train", lr, global_step)
                     writer.add_scalar("Throughput/Train_ImgsPerSec", imgs_per_sec, global_step)
                     writer.add_scalar("Throughput/Train_MsPerStep", dt * 1000.0, global_step)
                     writer.flush()
 
                 if args.mlflow:
-                    global_step = (epoch - 1) * len(train_loader) + i
                     mlflow.log_metric("lr", lr, step=global_step)
                     mlflow.log_metric("train_imgs_per_sec", imgs_per_sec, step=global_step)
                     mlflow.log_metric("train_ms_per_step", dt * 1000.0, step=global_step)
@@ -292,12 +343,33 @@ def main() -> None:
             mlflow.log_metric("cer", cer, step=epoch)
             mlflow.log_metric("val_imgs_per_sec", val_imgs_per_sec, step=epoch)
 
+        last_ckpt_path = os.path.join(args.outdir, "last_model.pt")
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict() if use_amp else None,
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "epoch": epoch,
+                "global_step": global_step,
+                "char2idx": char2idx,
+                "idx2char": idx2char,
+                "args": vars(args),
+            },
+            last_ckpt_path,
+        )
+
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             ckpt_path = os.path.join(args.outdir, "best_model.pt")
             torch.save(
                 {
                     "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict() if use_amp else None,
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                    "epoch": epoch,
+                    "global_step": global_step,
                     "char2idx": char2idx,
                     "idx2char": idx2char,
                     "args": vars(args),
