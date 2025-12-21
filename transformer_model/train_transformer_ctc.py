@@ -19,6 +19,33 @@ from transformer_model.model import TransformerCtcRecognizer
 from transformer_model.vocab import build_vocab_from_alphabet, code128_alphabet
 
 
+def _edit_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    if len(a) < len(b):
+        a, b = b, a
+
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            ins = cur[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (ca != cb)
+            cur.append(min(ins, dele, sub))
+        prev = cur
+    return prev[-1]
+
+
+def _cer(pred: str, target: str) -> tuple[int, int]:
+    return _edit_distance(pred, target), len(target)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="my_dataset")
@@ -193,6 +220,8 @@ def main() -> None:
         val_loss = 0.0
         n_exact = 0
         total_v = 0
+        total_edits = 0
+        total_chars = 0
 
         with torch.no_grad():
             val_t0 = time.perf_counter()
@@ -216,11 +245,15 @@ def main() -> None:
                 for p, t in zip(preds, targets):
                     if p == t:
                         n_exact += 1
+                    ed, ch = _cer(p, t)
+                    total_edits += ed
+                    total_chars += ch
                     total_v += 1
 
         avg_train = train_loss / max(1, len(train_loader))
         avg_val = val_loss / max(1, len(val_loader))
         acc = (n_exact / total_v) * 100 if total_v > 0 else 0.0
+        cer = (total_edits / max(1, total_chars)) if total_chars > 0 else 0.0
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -229,19 +262,21 @@ def main() -> None:
 
         print(
             f"--- Epoch {epoch} Summary | Val Loss: {avg_val:.4f} | Acc: {acc:.2f}% | "
-            f"Time: {time.time()-t0:.2f}s | Val {val_imgs_per_sec:.1f} img/s ---"
+            f"CER: {cer:.4f} | Time: {time.time()-t0:.2f}s | Val {val_imgs_per_sec:.1f} img/s ---"
         )
 
         if writer:
             writer.add_scalar("Loss/Train", avg_train, epoch)
             writer.add_scalar("Loss/Val", avg_val, epoch)
             writer.add_scalar("Accuracy/Val", acc, epoch)
+            writer.add_scalar("CER/Val", cer, epoch)
             writer.add_scalar("Throughput/Val_ImgsPerSec", val_imgs_per_sec, epoch)
 
         if args.mlflow:
             mlflow.log_metric("train_loss", avg_train, step=epoch)
             mlflow.log_metric("val_loss", avg_val, step=epoch)
             mlflow.log_metric("accuracy", acc, step=epoch)
+            mlflow.log_metric("cer", cer, step=epoch)
             mlflow.log_metric("val_imgs_per_sec", val_imgs_per_sec, step=epoch)
 
         if avg_val < best_val_loss:

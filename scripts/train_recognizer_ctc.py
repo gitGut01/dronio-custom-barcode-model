@@ -130,6 +130,33 @@ def greedy_ctc_decode(log_probs_tbc: torch.Tensor, idx2char: Dict[int, str]) -> 
         out.append("".join(chars))
     return out
 
+
+def _edit_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    if len(a) < len(b):
+        a, b = b, a
+
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            ins = cur[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (ca != cb)
+            cur.append(min(ins, dele, sub))
+        prev = cur
+    return prev[-1]
+
+
+def _cer(pred: str, target: str) -> tuple[int, int]:
+    return _edit_distance(pred, target), len(target)
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="my_dataset")
@@ -212,6 +239,8 @@ def main() -> None:
         # Validation
         model.eval()
         val_loss, n_exact, total_v = 0.0, 0, 0
+        total_edits = 0
+        total_chars = 0
         with torch.no_grad():
             for xb, x_w_lens, y_concat, y_lens, _, targets in val_loader:
                 xb, y_concat, y_lens = xb.to(device), y_concat.to(device), y_lens.to(device)
@@ -221,21 +250,27 @@ def main() -> None:
                 preds = greedy_ctc_decode(log_probs, idx2char)
                 for p, t in zip(preds, targets):
                     if p == t: n_exact += 1
+                    ed, ch = _cer(p, t)
+                    total_edits += ed
+                    total_chars += ch
                     total_v += 1
 
         avg_train, avg_val = train_loss/len(train_loader), val_loss/len(val_loader)
         acc = (n_exact / total_v) * 100
+        cer = (total_edits / max(1, total_chars)) if total_chars > 0 else 0.0
         
-        print(f"--- Epoch {epoch} Summary | Val Loss: {avg_val:.4f} | Acc: {acc:.2f}% ---")
+        print(f"--- Epoch {epoch} Summary | Val Loss: {avg_val:.4f} | Acc: {acc:.2f}% | CER: {cer:.4f} ---")
 
         if writer:
             writer.add_scalar("Loss/Train", avg_train, epoch)
             writer.add_scalar("Loss/Val", avg_val, epoch)
             writer.add_scalar("Accuracy/Val", acc, epoch)
+            writer.add_scalar("CER/Val", cer, epoch)
         if args.mlflow:
             mlflow.log_metric("train_loss", avg_train, step=epoch)
             mlflow.log_metric("val_loss", avg_val, step=epoch)
             mlflow.log_metric("accuracy", acc, step=epoch)
+            mlflow.log_metric("cer", cer, step=epoch)
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
