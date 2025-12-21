@@ -200,23 +200,26 @@ def main() -> None:
 
             train_loss += loss.item()
             if args.log_interval > 0 and i % args.log_interval == 0:
+                lr = float(optimizer.param_groups[0]["lr"]) if len(optimizer.param_groups) > 0 else float("nan")
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 dt = max(1e-9, time.perf_counter() - step_t0)
                 imgs_per_sec = float(xb.size(0)) / dt
                 print(
                     f"Epoch {epoch} [{i}/{len(train_loader)}] Loss: {loss.item():.4f} | "
-                    f"{imgs_per_sec:.1f} img/s | {dt*1000.0:.1f} ms/step"
+                    f"LR: {lr:.6g} | {imgs_per_sec:.1f} img/s | {dt*1000.0:.1f} ms/step"
                 )
 
                 if writer:
                     global_step = (epoch - 1) * len(train_loader) + i
+                    writer.add_scalar("LR/Train", lr, global_step)
                     writer.add_scalar("Throughput/Train_ImgsPerSec", imgs_per_sec, global_step)
                     writer.add_scalar("Throughput/Train_MsPerStep", dt * 1000.0, global_step)
                     writer.flush()
 
                 if args.mlflow:
                     global_step = (epoch - 1) * len(train_loader) + i
+                    mlflow.log_metric("lr", lr, step=global_step)
                     mlflow.log_metric("train_imgs_per_sec", imgs_per_sec, step=global_step)
                     mlflow.log_metric("train_ms_per_step", dt * 1000.0, step=global_step)
 
@@ -258,6 +261,7 @@ def main() -> None:
 
         avg_train = train_loss / max(1, len(train_loader))
         avg_val = val_loss / max(1, len(val_loader))
+        epoch_lr = float(optimizer.param_groups[0]["lr"]) if len(optimizer.param_groups) > 0 else float("nan")
         acc = (n_exact / total_v) * 100 if total_v > 0 else 0.0
         cer = (total_edits / max(1, total_chars)) if total_chars > 0 else 0.0
 
@@ -274,6 +278,7 @@ def main() -> None:
         if writer:
             writer.add_scalar("Loss/Train", avg_train, epoch)
             writer.add_scalar("Loss/Val", avg_val, epoch)
+            writer.add_scalar("LR/Epoch", epoch_lr, epoch)
             writer.add_scalar("Accuracy/Val", acc, epoch)
             writer.add_scalar("CER/Val", cer, epoch)
             writer.add_scalar("Throughput/Val_ImgsPerSec", val_imgs_per_sec, epoch)
@@ -282,6 +287,7 @@ def main() -> None:
         if args.mlflow:
             mlflow.log_metric("train_loss", avg_train, step=epoch)
             mlflow.log_metric("val_loss", avg_val, step=epoch)
+            mlflow.log_metric("lr_epoch", epoch_lr, step=epoch)
             mlflow.log_metric("accuracy", acc, step=epoch)
             mlflow.log_metric("cer", cer, step=epoch)
             mlflow.log_metric("val_imgs_per_sec", val_imgs_per_sec, step=epoch)
