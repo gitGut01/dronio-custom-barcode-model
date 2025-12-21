@@ -158,7 +158,12 @@ def main() -> None:
         anneal_strategy="cos",
     )
 
-    writer = SummaryWriter(args.tb_logdir) if args.tb else None
+    tb_logdir = None
+    if args.tb:
+        tb_logdir = str(Path(args.tb_logdir).expanduser().resolve())
+        os.makedirs(tb_logdir, exist_ok=True)
+        print(f"--- TensorBoard logdir: {tb_logdir} ---")
+    writer = SummaryWriter(tb_logdir, flush_secs=10) if args.tb else None
 
     if args.mlflow:
         if args.mlflow_tracking_uri:
@@ -208,6 +213,7 @@ def main() -> None:
                     global_step = (epoch - 1) * len(train_loader) + i
                     writer.add_scalar("Throughput/Train_ImgsPerSec", imgs_per_sec, global_step)
                     writer.add_scalar("Throughput/Train_MsPerStep", dt * 1000.0, global_step)
+                    writer.flush()
 
                 if args.mlflow:
                     global_step = (epoch - 1) * len(train_loader) + i
@@ -271,6 +277,7 @@ def main() -> None:
             writer.add_scalar("Accuracy/Val", acc, epoch)
             writer.add_scalar("CER/Val", cer, epoch)
             writer.add_scalar("Throughput/Val_ImgsPerSec", val_imgs_per_sec, epoch)
+            writer.flush()
 
         if args.mlflow:
             mlflow.log_metric("train_loss", avg_train, step=epoch)
