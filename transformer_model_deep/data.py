@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
+import numpy as np
+from PIL import Image
+
 import torch
 import torch.nn.functional as F
-from torchvision.io import ImageReadMode, read_image
 from torch.utils.data import Dataset
 
 
@@ -52,20 +54,14 @@ class BarcodeCtcDataset(Dataset):
 
     def _load_image(self, path: Path) -> torch.Tensor:
         try:
-            x_u8 = read_image(str(path), mode=ImageReadMode.RGB)
-            if x_u8.dim() != 3:
-                raise ValueError("Expected image tensor to be (C,H,W)")
-
-            _, h, w = x_u8.shape
-            if h <= 0 or w <= 0:
-                raise ValueError("Invalid image shape")
-
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
             scale = self.height / float(h)
             new_w = max(1, int(round(w * scale)))
-
-            x = x_u8.to(dtype=torch.float32).div_(255.0).unsqueeze(0)
-            x = F.interpolate(x, size=(self.height, new_w), mode="bilinear", align_corners=False)
-            return x.squeeze(0)
+            img = img.resize((new_w, self.height), resample=Image.Resampling.BILINEAR)
+            arr = np.asarray(img).astype(np.float32) / 255.0
+            arr = np.transpose(arr, (2, 0, 1))
+            return torch.from_numpy(arr)
         except Exception:
             return torch.ones((3, self.height, self.height * 2))
 
