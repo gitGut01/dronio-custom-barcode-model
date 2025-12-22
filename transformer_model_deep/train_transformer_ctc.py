@@ -49,7 +49,7 @@ def _cer(pred: str, target: str) -> tuple[int, int]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="my_dataset")
-    ap.add_argument("--height", type=int, default=64)
+    ap.add_argument("--height", type=int, default=96)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=2e-4)
