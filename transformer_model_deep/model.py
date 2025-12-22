@@ -126,8 +126,12 @@ class TransformerCtcRecognizer(nn.Module):
 
         seq = self.pos(seq)
 
-        input_lengths = torch.div(x_w_lens, self._downsample_factor_w, rounding_mode="floor").clamp_min(1)
         t = seq.size(1)
+        input_lengths = (
+            torch.div(x_w_lens, self._downsample_factor_w, rounding_mode="floor")
+            .clamp_min(1)
+            .clamp_max(t)
+        )
         device = seq.device
 
         arange = torch.arange(t, device=device).unsqueeze(0)

@@ -13,10 +13,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 import mlflow
 
-from transformer_model.data import BarcodeCtcDataset, ctc_collate, read_labels_csv
-from transformer_model.decode import beam_ctc_decode, greedy_ctc_decode
+from transformer_model_deep.data import BarcodeCtcDataset, ctc_collate, read_labels_csv
+from transformer_model_deep.decode import beam_ctc_decode, greedy_ctc_decode
 from transformer_model_deep.model import TransformerCtcRecognizer
-from transformer_model.vocab import build_vocab_from_alphabet, code128_alphabet
+from transformer_model_deep.vocab import build_vocab_from_alphabet, code128_alphabet
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -109,7 +109,7 @@ def main() -> None:
     }
     if args.num_workers > 0:
         loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
+        loader_kwargs["prefetch_factor"] = 1 # 2
 
     train_loader = DataLoader(
         BarcodeCtcDataset(train_samples, char2idx, args.height),
