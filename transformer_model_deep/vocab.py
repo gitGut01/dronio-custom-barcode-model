@@ -10,14 +10,14 @@ def code128_alphabet_old() -> str:
 def code128_alphabet() -> str:
     tags = ["[EAN13]", "[EAN8]", "[UPCA]", "[CODE39]", "[CODE128]"]
     chars = [chr(i) for i in range(32, 127)]
-
-    full_vocab = tags + chars
+    
+    full_vocab = ["[BLANK]"] + tags + chars
+    
     char_to_idx = {char: i for i, char in enumerate(full_vocab)}
     return char_to_idx
 
 
 def build_vocab_from_alphabet(alphabet: str) -> Tuple[Dict[str, int], Dict[int, str]]:
-    # Reserve 0 for the CTC blank. Characters start from 1.
     seen = set()
     deduped: List[str] = []
     for ch in alphabet:
