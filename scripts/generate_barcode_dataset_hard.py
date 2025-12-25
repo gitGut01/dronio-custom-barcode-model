@@ -655,8 +655,14 @@ def generate_split(
                 motion_blur_angle_jitter_deg=float(motion_blur_angle_jitter_deg),
             )
 
-            filename = f"{split}_{i:07d}.png"
-            final_img.save(images_dir / filename, format="PNG", optimize=True)
+            filename = f"{split}_{i:07d}.jpg"
+            final_img.save(
+                images_dir / filename,
+                format="JPEG",
+                quality=85,
+                optimize=True,
+                progressive=True,
+            )
             writer.writerow([f"images/{filename}", spec.symbology, spec.value])
 
     if skipped_gs1:
