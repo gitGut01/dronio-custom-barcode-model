@@ -8,7 +8,7 @@ def code128_alphabet_old() -> str:
 
 
 def code128_alphabet() -> str:
-    tags = ["[EAN13]", "[EAN8]", "[UPCA]", "[CODE39]", "[CODE128]"]
+    tags = ["[EAN13]", "[EAN8]", "[UPCA]", "[CODE39]", "[CODE128]", "[ITF]"]
     chars = [chr(i) for i in range(32, 127)]
     
     full_vocab = ["[BLANK]"] + tags + chars

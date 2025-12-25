@@ -693,9 +693,9 @@ def parse_symbology_probs(s: str) -> Dict[str, float]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate synthetic 1D barcode dataset")
     ap.add_argument("--out", type=str, default="my_dataset", help="Output directory")
-    ap.add_argument("--train", type=int, default=1000000, help="Number of training samples")
-    ap.add_argument("--val", type=int, default=100000, help="Number of validation samples")
-    ap.add_argument("--test", type=int, default=100000, help="Number of test samples")
+    ap.add_argument("--train", type=int, default=0, help="Number of training samples")
+    ap.add_argument("--val", type=int, default=0, help="Number of validation samples")
+    ap.add_argument("--test", type=int, default=0, help="Number of test samples")
     ap.add_argument(
         "--zip",
         action=argparse.BooleanOptionalAction,
