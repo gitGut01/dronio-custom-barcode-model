@@ -1,5 +1,28 @@
 import pandas as pd
 
+
+
+def code128_codeword_for_ascii_b(ch: str) -> int:
+    o = ord(ch)
+    if o < 32 or o > 126:
+        raise ValueError(f"Code128-B only supports ASCII 32..126. Got {repr(ch)} (ord={o})")
+    return o - 32  # 0..94
+
+
+def calculate_code128_checksum_codeword_b(data: str) -> int:
+    start_code_b = 104
+    total = start_code_b
+    for i, ch in enumerate(str(data), start=1):
+        total += i * code128_codeword_for_ascii_b(ch)
+    return total % 103
+
+
+def encode_code128_checksum_char(codeword: int) -> str:
+    if codeword < 0 or codeword > 102:
+        raise ValueError(f"Invalid Code128 checksum codeword: {codeword}")
+    return chr(0xE000 + codeword)
+
+
 def calculate_mod10_check_digit(digits_body):
     reversed_digits = digits_body[::-1]
     odd_sum = sum(reversed_digits[0::2])
@@ -58,21 +81,6 @@ def calculate_code39_checksum(data):
     except:
         return ""
 
-def symbology_to_tag(symbology: str) -> str:
-    s = str(symbology).lower()
-    if 'ean13' in s:
-        return "[EAN13]"
-    if 'ean8' in s:
-        return "[EAN8]"
-    if 'upca' in s:
-        return "[UPCA]"
-    if 'code39' in s:
-        return "[CODE39]"
-    if 'code128' in s:
-        return "[CODE128]"
-    if 'itf' in s:
-        return "[ITF]"
-    return ""  # or "[UNKNOWN]"
 
 def process_barcodes(input_file, output_file):
     df = pd.read_csv(input_file)
@@ -80,7 +88,6 @@ def process_barcodes(input_file, output_file):
     def update_value(row):
         symbology = str(row['symbology']).lower()
         val = str(row['value'])
-        tag = symbology_to_tag(symbology)
 
         checksum = ""
         if 'ean8' in symbology or 'upca' in symbology or 'ean13' in symbology:
@@ -90,9 +97,13 @@ def process_barcodes(input_file, output_file):
         elif 'code39' in symbology:
             checksum = calculate_code39_checksum(val)
         elif 'code128' in symbology:
-            checksum = ""
+            try:
+                cw = calculate_code128_checksum_codeword_b(val)
+                checksum = encode_code128_checksum_char(cw)
+            except Exception:
+                checksum = ""
 
-        return f"{tag}{val}{checksum}"
+        return f"{val}{checksum}"
 
     df['value'] = df.apply(update_value, axis=1)
     df.to_csv(output_file, index=False)
