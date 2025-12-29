@@ -7,6 +7,7 @@ from pathlib import Path
 import gdown
 
 DEFAULT_GDRIVE_FILE_ID = "1OkgxBTgSOse2uKqYf306bJYmvSq-eC5T"
+# "1ibvuZUaG65Tv1i5U2zhDRlZrRr62m8FG"
 
 def _die(message: str, exit_code: int = 2) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
@@ -122,13 +123,14 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = (repo_root / args.output_dir).resolve()
     labels_dir = (repo_root / args.labels_dir).resolve()
 
-    # Determine where the zip is or should be
     if args.zip_path:
         zip_path = Path(args.zip_path).expanduser().resolve()
     else:
-        zip_path = "dataset.zip"
+        zip_path = repo_root / "dataset.zip" # Use Path here
 
-    extract_dir = "my_dataset"
+    # FIX 2: Ensure extract_dir is a Path object
+    # Note: I'm calling it 'temp_extract' to avoid conflict with 'output_dir'
+    extract_dir = repo_root / "temp_extracted_data"
 
     # 1. Download
     if not args.skip_download:

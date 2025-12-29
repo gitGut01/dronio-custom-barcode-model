@@ -93,8 +93,20 @@ def main() -> None:
 
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-        torch.backends.cudnn.conv.fp32_precision = "tf32"
+
+        # Prefer newer PyTorch API if available
+        if hasattr(torch, "set_float32_matmul_precision"):
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+
+        # Enable TF32 where supported (older API)
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+                torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = True
 
     train_samples = read_labels_csv(Path(args.data), "train")
     val_samples = read_labels_csv(Path(args.data), "val")
