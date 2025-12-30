@@ -73,6 +73,10 @@ def main() -> None:
     ap.add_argument("--decode", type=str, default="greedy", choices=["greedy", "beam"])
     ap.add_argument("--beam-width", type=int, default=10)
 
+    ap.add_argument("--print-dist", action="store_true")
+    ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--only-nonblank", action="store_true")
+
     ap.add_argument("--enc-base", type=int, default=None)
     ap.add_argument("--d-model", type=int, default=None)
     ap.add_argument("--nhead", type=int, default=None)
@@ -128,6 +132,29 @@ def main() -> None:
 
     with torch.no_grad():
         log_probs_tbc, _ = model(xb, x_w_lens)
+
+    if args.print_dist:
+        probs_tbc = log_probs_tbc.exp()
+        t_steps, bsz, vocab = probs_tbc.shape
+        topk = int(args.topk)
+
+        for b in range(bsz):
+            print(f"=== Distribution (sample b={b}) ===")
+            for t in range(t_steps):
+                p = probs_tbc[t, b]
+                val, idx = torch.topk(p, k=min(topk, vocab))
+
+                best_id = int(idx[0].item())
+                if args.only_nonblank and best_id == 0:
+                    continue
+
+                items = []
+                for vv, ii in zip(val.tolist(), idx.tolist()):
+                    ii = int(ii)
+                    tok = "<blk>" if ii == 0 else idx2char.get(ii, f"<{ii}>")
+                    items.append(f"{tok}:{vv:.3f}")
+
+                print(f"t={t:03d} best={best_id} " + " ".join(items))
 
     if args.decode == "beam":
         try:
