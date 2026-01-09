@@ -76,6 +76,9 @@ def main() -> None:
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--aug-prob", type=float, default=0.9)
 
+    ap.add_argument("--viz", action="store_true")
+    ap.add_argument("--viz-n", type=int, default=8)
+
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--log-interval", type=int, default=100)
 
@@ -126,15 +129,24 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 1 # 2
 
+    train_ds = BarcodeCtcDataset(
+        train_samples,
+        char2idx,
+        args.height,
+        augment=bool(args.aug),
+        augment_prob=float(args.aug_prob),
+    )
+    val_ds = BarcodeCtcDataset(val_samples, char2idx, args.height, augment=False)
+
     train_loader = DataLoader(
-        BarcodeCtcDataset(train_samples, char2idx, args.height, augment=bool(args.aug), augment_prob=float(args.aug_prob)),
+        train_ds,
         batch_size=args.batch,
         shuffle=True,
         **loader_kwargs,
         collate_fn=ctc_collate,
     )
     val_loader = DataLoader(
-        BarcodeCtcDataset(val_samples, char2idx, args.height, augment=False),
+        val_ds,
         batch_size=args.batch,
         shuffle=False,
         **loader_kwargs,
@@ -237,6 +249,75 @@ def main() -> None:
         mlflow.start_run()
 
     best_val_loss = float("inf")
+
+    def _make_grid_2col(imgs: list[torch.Tensor], pad: int = 2, pad_value: float = 0.0) -> torch.Tensor:
+        if not imgs:
+            return torch.empty((3, 1, 1), dtype=torch.float32)
+        c = int(imgs[0].shape[0])
+        h = max(int(t.shape[1]) for t in imgs)
+        w = max(int(t.shape[2]) for t in imgs)
+
+        padded = []
+        for t in imgs:
+            if t.shape[0] != c:
+                raise ValueError("All images must have same channels")
+            dh = h - int(t.shape[1])
+            dw = w - int(t.shape[2])
+            if dh < 0 or dw < 0:
+                raise ValueError("Unexpected negative padding")
+            padded.append(torch.nn.functional.pad(t, (0, dw, 0, dh), value=pad_value))
+
+        rows = []
+        for i in range(0, len(padded), 2):
+            left = padded[i]
+            right = padded[i + 1] if i + 1 < len(padded) else torch.full_like(left, pad_value)
+            if pad > 0:
+                spacer = torch.full((c, h, pad), pad_value, dtype=left.dtype, device=left.device)
+                row = torch.cat([left, spacer, right], dim=2)
+            else:
+                row = torch.cat([left, right], dim=2)
+            rows.append(row)
+
+        if pad > 0:
+            hsp = torch.full((c, pad, rows[0].shape[2]), pad_value, dtype=rows[0].dtype, device=rows[0].device)
+            out = torch.cat([r if j == 0 else torch.cat([hsp, r], dim=1) for j, r in enumerate(rows)], dim=1)
+        else:
+            out = torch.cat(rows, dim=1)
+
+        return out
+
+    def _log_viz(epoch_i: int) -> None:
+        if not writer or not bool(args.viz):
+            return
+        if not hasattr(val_ds, "load_resized_rgb_u8"):
+            return
+
+        n = int(args.viz_n)
+        if n <= 0:
+            return
+
+        n = min(n, len(val_ds))
+        if n <= 0:
+            return
+
+        aug = None
+        if hasattr(train_ds, "get_augmenter"):
+            aug = train_ds.get_augmenter()
+
+        imgs = []
+        for i in range(n):
+            s = val_ds.samples[i]
+            rgb = val_ds.load_resized_rgb_u8(s.image_path)
+            rgb_aug = val_ds.apply_augment_to_rgb_u8(rgb, augmenter=aug)
+
+            t0 = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+            t1 = torch.from_numpy(rgb_aug).permute(2, 0, 1).float() / 255.0
+            imgs.append(t0)
+            imgs.append(t1)
+
+        grid = _make_grid_2col(imgs, pad=2, pad_value=0.0)
+        writer.add_image("Viz/Val_Orig_Aug", grid, global_step=epoch_i)
+        writer.flush()
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
@@ -392,6 +473,8 @@ def main() -> None:
                 ckpt_path,
             )
             print(f"  --> Saved new best model to {ckpt_path}")
+
+        _log_viz(epoch)
 
     if writer:
         writer.close()

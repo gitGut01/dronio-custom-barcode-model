@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
 
@@ -102,6 +102,37 @@ class BarcodeCtcDataset(Dataset):
                     ),
                 ]
             )
+
+    def get_augmenter(self):
+        return self._aug
+
+    def load_resized_rgb_u8(self, path: Path) -> np.ndarray:
+        if cv2 is None:
+            raise RuntimeError("cv2 is required for image loading")
+
+        bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"Failed to read image: {path}")
+
+        h, w = bgr.shape[:2]
+        scale = self.height / float(h)
+        new_w = max(1, int(round(w * scale)))
+        interp = cv2.INTER_AREA if new_w < w else cv2.INTER_LINEAR
+        bgr = cv2.resize(bgr, (new_w, self.height), interpolation=interp)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return rgb
+
+    def apply_augment_to_rgb_u8(self, rgb_u8: np.ndarray, augmenter: Optional[object] = None) -> np.ndarray:
+        aug = augmenter if augmenter is not None else self._aug
+        if aug is None:
+            return rgb_u8
+        if cv2 is None:
+            raise RuntimeError("cv2 is required for augmentations")
+
+        bgr = rgb_u8[:, :, ::-1]
+        out = aug(image=bgr)
+        bgr = out["image"]
+        return bgr[:, :, ::-1]
 
     def __len__(self) -> int:
         return len(self.samples)
