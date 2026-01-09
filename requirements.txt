@@ -8,5 +8,6 @@ tqdm==4.67.1
 #torch
 #torchvision
 mlflow
+opencv-python
 # Optional (for GS1 DataBar and other symbologies via BWIPP). Requires Ghostscript installed.
 # treepoem==3.28.0
