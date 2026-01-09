@@ -40,6 +40,9 @@ class ModernConvEncoderW4(nn.Module):
         self.downsample = nn.Conv2d(base, base * 4, kernel_size=2, stride=2)
         self.stage2 = nn.Sequential(*[ConvNeXtBlock(base * 4) for _ in range(depth)])
 
+        self.downsample2 = nn.Conv2d(base * 4, base * 8, kernel_size=(2, 1), stride=(2, 1))
+        self.stage3 = nn.Sequential(*[ConvNeXtBlock(base * 8) for _ in range(depth)])
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem_conv(x)
         x = x.permute(0, 2, 3, 1)
@@ -49,6 +52,9 @@ class ModernConvEncoderW4(nn.Module):
         x = self.stage1(x)
         x = self.downsample(x)
         x = self.stage2(x)
+
+        x = self.downsample2(x)
+        x = self.stage3(x)
         return x
 
 
@@ -86,9 +92,9 @@ class TransformerCtcRecognizer(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.encoder = ModernConvEncoderW4(3, base=enc_base)
+        self.encoder = ModernConvEncoderW4(3, base=enc_base, depth=4)
         self._downsample_factor_w = 4
-        enc_out_ch = enc_base * 4
+        enc_out_ch = enc_base * 8
 
         self.proj = nn.Linear(enc_out_ch, d_model)
         self.pos = SinusoidalPositionalEncoding(d_model)

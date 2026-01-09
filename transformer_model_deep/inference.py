@@ -169,7 +169,13 @@ def main() -> None:
     else:
         pred = greedy_ctc_decode(log_probs_tbc, idx2char)[0]
 
-    print(pred)
+    # If tokens are Code128 codewords encoded in the Private Use Area (U+E000..),
+    # also print the numeric codewords for easier inspection.
+    if pred and all(0xE000 <= ord(ch) <= 0xE06A for ch in pred):
+        codewords = [str(ord(ch) - 0xE000) for ch in pred]
+        print(" ".join(codewords))
+    else:
+        print(pred)
 
 
 if __name__ == "__main__":

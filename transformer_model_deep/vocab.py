@@ -7,9 +7,7 @@ def code128_alphabet_old() -> str:
     return "".join(chr(i) for i in range(32, 127))
 
 def code128_alphabet() -> str:
-    ascii_chars = "".join(chr(i) for i in range(32, 127))  # 95 chars
-    checksum_chars = "".join(chr(0xE000 + i) for i in range(103))  # 103 chars
-    return ascii_chars + checksum_chars
+    return "".join(chr(0xE000 + i) for i in range(107))
 
 
 def build_vocab_from_alphabet(alphabet: str) -> Tuple[Dict[str, int], Dict[int, str]]:

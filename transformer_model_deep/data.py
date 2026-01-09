@@ -6,11 +6,22 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
-from PIL import Image
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+
+
+try:
+    import albumentations as A  # type: ignore
+except Exception:
+    A = None
+
+
+try:
+    import cv2  # type: ignore
+except Exception:
+    cv2 = None
 
 
 @dataclass(frozen=True)
@@ -44,24 +55,83 @@ def read_labels_csv(dataset_root: Path, split: str) -> List[Sample]:
 
 
 class BarcodeCtcDataset(Dataset):
-    def __init__(self, samples: Sequence[Sample], char2idx: Dict[str, int], height: int) -> None:
+    def __init__(
+        self,
+        samples: Sequence[Sample],
+        char2idx: Dict[str, int],
+        height: int,
+        augment: bool = False,
+        augment_prob: float = 0.9,
+    ) -> None:
         self.samples = list(samples)
         self.char2idx = char2idx
         self.height = int(height)
+        self.augment = bool(augment)
+        self.augment_prob = float(augment_prob)
+
+        self._aug = None
+        if self.augment:
+            if A is None or cv2 is None:
+                raise RuntimeError("Augmentations requested but albumentations/opencv not available")
+
+            self._aug = A.Compose(
+                [
+                    A.Affine(
+                        scale=(0.85, 1.15),
+                        translate_percent=(0.0, 0.02),
+                        rotate=(-18, 18),
+                        shear=(-12, 12),
+                        interpolation=cv2.INTER_LINEAR,
+                        mode=cv2.BORDER_REFLECT_101,
+                        p=0.95,
+                    ),
+                    A.Perspective(scale=(0.02, 0.08), keep_size=True, p=0.6),
+                    A.OneOf(
+                        [
+                            A.MotionBlur(blur_limit=(7, 21), p=1.0),
+                            A.GaussianBlur(blur_limit=(3, 11), p=1.0),
+                        ],
+                        p=0.75,
+                    ),
+                    A.OneOf(
+                        [
+                            A.Downscale(scale_min=0.35, scale_max=0.85, interpolation=cv2.INTER_AREA, p=1.0),
+                            A.ImageCompression(quality_lower=25, quality_upper=85, p=1.0),
+                        ],
+                        p=0.8,
+                    ),
+                ]
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def _load_image(self, path: Path) -> torch.Tensor:
         try:
-            img = Image.open(path).convert("RGB")
-            w, h = img.size
+            if cv2 is None:
+                raise RuntimeError("cv2 is required for image loading")
+
+            bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise FileNotFoundError(f"Failed to read image: {path}")
+
+            h, w = bgr.shape[:2]
             scale = self.height / float(h)
             new_w = max(1, int(round(w * scale)))
-            img = img.resize((new_w, self.height), resample=Image.Resampling.BILINEAR)
-            arr = np.asarray(img).astype(np.float32) / 255.0
+
+            # Use INTER_AREA for downscale, INTER_LINEAR for upscale
+            interp = cv2.INTER_AREA if new_w < w else cv2.INTER_LINEAR
+            bgr = cv2.resize(bgr, (new_w, self.height), interpolation=interp)
+
+            if self._aug is not None and np.random.rand() < self.augment_prob:
+                out = self._aug(image=bgr)
+                bgr = out["image"]
+
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            arr = rgb.astype(np.float32) / 255.0
             arr = np.transpose(arr, (2, 0, 1))
             return torch.from_numpy(arr)
+
         except Exception:
             return torch.ones((3, self.height, self.height * 2))
 

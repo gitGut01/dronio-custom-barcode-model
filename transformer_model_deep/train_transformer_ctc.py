@@ -61,17 +61,20 @@ def main() -> None:
 
     ap.add_argument("--scheduler", type=str, default="onecycle", choices=["none", "onecycle", "cosine"])
 
-    ap.add_argument("--enc-base", type=int, default=48)
+    ap.add_argument("--enc-base", type=int, default=64)
     ap.add_argument("--d-model", type=int, default=384)
     ap.add_argument("--nhead", type=int, default=8)
-    ap.add_argument("--num-layers", type=int, default=6)
+    ap.add_argument("--num-layers", type=int, default=4)
     ap.add_argument("--ff", type=int, default=1536)
-    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--dropout", type=float, default=0.15)
 
     ap.add_argument("--decode", type=str, default="greedy", choices=["beam", "greedy"])
     ap.add_argument("--beam-width", type=int, default=10)
 
     ap.add_argument("--num-workers", type=int, default=2)
+
+    ap.add_argument("--aug", action="store_true")
+    ap.add_argument("--aug-prob", type=float, default=0.9)
 
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--log-interval", type=int, default=100)
@@ -124,14 +127,14 @@ def main() -> None:
         loader_kwargs["prefetch_factor"] = 1 # 2
 
     train_loader = DataLoader(
-        BarcodeCtcDataset(train_samples, char2idx, args.height),
+        BarcodeCtcDataset(train_samples, char2idx, args.height, augment=bool(args.aug), augment_prob=float(args.aug_prob)),
         batch_size=args.batch,
         shuffle=True,
         **loader_kwargs,
         collate_fn=ctc_collate,
     )
     val_loader = DataLoader(
-        BarcodeCtcDataset(val_samples, char2idx, args.height),
+        BarcodeCtcDataset(val_samples, char2idx, args.height, augment=False),
         batch_size=args.batch,
         shuffle=False,
         **loader_kwargs,
