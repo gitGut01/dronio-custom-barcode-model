@@ -582,9 +582,9 @@ def generate_split(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=str, default="code128_dataset")
-    ap.add_argument("--train", type=int, default=20)
-    ap.add_argument("--val", type=int, default=20)
-    ap.add_argument("--test", type=int, default=20)
+    ap.add_argument("--train", type=int, default=1000000)
+    ap.add_argument("--val", type=int, default=100000)
+    ap.add_argument("--test", type=int, default=100000)
     ap.add_argument("--seed", type=int, default=123)
  
     ap.add_argument("--size-min", type=int, default=256)
