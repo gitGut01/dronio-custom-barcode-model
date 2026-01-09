@@ -602,22 +602,43 @@ def apply_pipeline(
 def _sample_size(
     size_min: int,
     size_max: int,
+    max_width: int,
+    max_height: int,
     landscape_prob: float,
     aspect_min: float,
     aspect_max: float,
 ) -> Tuple[int, int]:
-    base = random.randint(size_min, size_max)
-    aspect = random.uniform(aspect_min, aspect_max)
+    size_min = max(1, int(size_min))
+    size_max = max(size_min, int(size_max))
+    max_width = max(1, int(max_width))
+    max_height = max(1, int(max_height))
+
     landscape = random.random() < landscape_prob
- 
+
+    # Sample sizes while respecting hard max bounds.
+    # We treat `base` as the shorter side (height in landscape, width in portrait).
     if landscape:
+        base_upper = min(size_max, max_height)
+        base = random.randint(size_min, max(size_min, base_upper))
+        # Ensure aspect doesn't exceed max_width/base.
+        allowed_aspect_max = min(aspect_max, max_width / max(1, base))
+        allowed_aspect_min = min(aspect_min, allowed_aspect_max)
+        aspect = random.uniform(allowed_aspect_min, allowed_aspect_max)
         w = int(round(base * aspect))
         h = base
     else:
+        base_upper = min(size_max, max_width)
+        base = random.randint(size_min, max(size_min, base_upper))
+        # Ensure aspect doesn't exceed max_height/base.
+        allowed_aspect_max = min(aspect_max, max_height / max(1, base))
+        allowed_aspect_min = min(aspect_min, allowed_aspect_max)
+        aspect = random.uniform(allowed_aspect_min, allowed_aspect_max)
         w = base
         h = int(round(base * aspect))
- 
-    return max(96, w), max(96, h)
+
+    w = max(1, min(max_width, w))
+    h = max(1, min(max_height, h))
+    return w, h
  
  
 _DIGITS = "0123456789"
@@ -664,6 +685,8 @@ def generate_split(
     seed: int,
     size_min: int,
     size_max: int,
+    max_width: int,
+    max_height: int,
     min_margin_ratio: float,
     max_margin_ratio: float,
     bg_white_prob: float,
@@ -699,6 +722,8 @@ def generate_split(
             canvas_size = _sample_size(
                 size_min=size_min,
                 size_max=size_max,
+                max_width=max_width,
+                max_height=max_height,
                 landscape_prob=landscape_prob,
                 aspect_min=aspect_min,
                 aspect_max=aspect_max,
@@ -742,9 +767,13 @@ def main() -> None:
     ap.add_argument("--val", type=int, default=100000)
     ap.add_argument("--test", type=int, default=100000)
     ap.add_argument("--seed", type=int, default=123)
- 
-    ap.add_argument("--size-min", type=int, default=256)
-    ap.add_argument("--size-max", type=int, default=640)
+
+    ap.add_argument("--zip", action=argparse.BooleanOptionalAction, default=True)
+
+    ap.add_argument("--size-min", type=int, default=48)
+    ap.add_argument("--size-max", type=int, default=190)
+    ap.add_argument("--max-width", type=int, default=200)
+    ap.add_argument("--max-height", type=int, default=190)
     ap.add_argument("--min-margin-ratio", type=float, default=0.02)
     ap.add_argument("--max-margin-ratio", type=float, default=0.20)
     ap.add_argument("--bg-white-prob", type=float, default=0.55)
@@ -752,8 +781,8 @@ def main() -> None:
     ap.add_argument("--quiet-zone-max-ratio", type=float, default=0.10)
     ap.add_argument("--quiet-zone-tight-crop-prob", type=float, default=0.18)
     ap.add_argument("--landscape-prob", type=float, default=0.7)
-    ap.add_argument("--aspect-min", type=float, default=1.2)
-    ap.add_argument("--aspect-max", type=float, default=3.2)
+    ap.add_argument("--aspect-min", type=float, default=1.0)
+    ap.add_argument("--aspect-max", type=float, default=3.0)
  
     ap.add_argument("--min-len", type=int, default=1)
     ap.add_argument("--max-len", type=int, default=20)
@@ -770,6 +799,8 @@ def main() -> None:
         seed=int(args.seed),
         size_min=int(args.size_min),
         size_max=int(args.size_max),
+        max_width=int(args.max_width),
+        max_height=int(args.max_height),
         min_margin_ratio=float(args.min_margin_ratio),
         max_margin_ratio=float(args.max_margin_ratio),
         bg_white_prob=float(args.bg_white_prob),
@@ -789,6 +820,8 @@ def main() -> None:
         seed=int(args.seed) + 1,
         size_min=int(args.size_min),
         size_max=int(args.size_max),
+        max_width=int(args.max_width),
+        max_height=int(args.max_height),
         min_margin_ratio=float(args.min_margin_ratio),
         max_margin_ratio=float(args.max_margin_ratio),
         bg_white_prob=float(args.bg_white_prob),
@@ -808,6 +841,8 @@ def main() -> None:
         seed=int(args.seed) + 2,
         size_min=int(args.size_min),
         size_max=int(args.size_max),
+        max_width=int(args.max_width),
+        max_height=int(args.max_height),
         min_margin_ratio=float(args.min_margin_ratio),
         max_margin_ratio=float(args.max_margin_ratio),
         bg_white_prob=float(args.bg_white_prob),
@@ -820,7 +855,10 @@ def main() -> None:
         min_len=int(args.min_len),
         max_len=int(args.max_len),
     )
- 
- 
+
+    if bool(args.zip):
+        shutil.make_archive(str(out_dir), "zip", root_dir=str(out_dir))
+
+
 if __name__ == "__main__":
     main()
