@@ -321,11 +321,74 @@ def _render_code128_raw(codewords: List[int]) -> Image.Image:
             pass
 
     return _render_code128_from_codewords(codewords)
- 
- 
-def random_background(size: Tuple[int, int]) -> Image.Image:
+
+
+def _tight_bbox_nonwhite(img: Image.Image, threshold: int = 250) -> Optional[Tuple[int, int, int, int]]:
+    arr = np.asarray(img)
+    if arr.ndim == 2:
+        mask = arr < threshold
+    else:
+        mask = np.any(arr < threshold, axis=2)
+    ys, xs = np.where(mask)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    x0 = int(xs.min())
+    y0 = int(ys.min())
+    x1 = int(xs.max()) + 1
+    y1 = int(ys.max()) + 1
+    return (x0, y0, x1, y1)
+
+
+def vary_quiet_zone(
+    barcode_img: Image.Image,
+    min_pad_ratio: float,
+    max_pad_ratio: float,
+    tight_crop_prob: float,
+) -> Image.Image:
+    b = barcode_img.convert("RGB")
+    bbox = _tight_bbox_nonwhite(b)
+    if bbox is None:
+        return b
+
+    x0, y0, x1, y1 = bbox
+    bw = max(1, x1 - x0)
+    bh = max(1, y1 - y0)
+
+    # Positive padding expands whitespace around bars.
+    # Small negative padding simulates tight crops that eat into the quiet zone.
+    pad_ratio = random.uniform(min_pad_ratio, max_pad_ratio)
+    base_pad_x = int(round(pad_ratio * bw))
+    base_pad_y = int(round(random.uniform(0.00, pad_ratio * 0.35) * bh))
+
+    def _sample_side_pad(base: int) -> int:
+        if random.random() < tight_crop_prob:
+            return -random.randint(0, max(0, int(round(0.25 * base))))
+        return random.randint(max(0, int(round(0.30 * base))), max(0, int(round(1.30 * base))))
+
+    pad_l = _sample_side_pad(base_pad_x)
+    pad_r = _sample_side_pad(base_pad_x)
+    pad_t = _sample_side_pad(base_pad_y)
+    pad_b = _sample_side_pad(base_pad_y)
+
+    # Clamp to image bounds.
+    nx0 = max(0, x0 - pad_l)
+    ny0 = max(0, y0 - pad_t)
+    nx1 = min(b.width, x1 + pad_r)
+    ny1 = min(b.height, y1 + pad_b)
+    if nx1 <= nx0 + 1 or ny1 <= ny0 + 1:
+        return b
+
+    return b.crop((nx0, ny0, nx1, ny1))
+
+
+def random_background(size: Tuple[int, int], white_prob: float) -> Image.Image:
     w, h = size
     choice = random.random()
+
+    if choice < white_prob:
+        return Image.new("RGB", (w, h), (255, 255, 255))
+
+    choice = (choice - white_prob) / max(1e-9, (1.0 - white_prob))
  
     if choice < 0.4:
         base = Image.new("RGB", (w, h), tuple(int(x) for x in np.random.randint(0, 255, size=3)))
@@ -351,15 +414,16 @@ def random_background(size: Tuple[int, int]) -> Image.Image:
 def place_barcode_on_canvas(
     barcode_img: Image.Image,
     canvas_size: Tuple[int, int],
-    max_margin_ratio: float,
+    margin_ratio: float,
+    bg_white_prob: float,
 ) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     canvas_w, canvas_h = canvas_size
-    bg = random_background((canvas_w, canvas_h))
+    bg = random_background((canvas_w, canvas_h), white_prob=bg_white_prob)
  
     b = barcode_img.copy()
  
-    min_b_w = int(math.ceil(canvas_w / (1.0 + 2.0 * max_margin_ratio)))
-    min_b_h = int(math.ceil(canvas_h / (1.0 + 2.0 * max_margin_ratio)))
+    min_b_w = int(math.ceil(canvas_w / (1.0 + 2.0 * margin_ratio)))
+    min_b_h = int(math.ceil(canvas_h / (1.0 + 2.0 * margin_ratio)))
  
     bw, bh = b.size
     scale = max(min_b_w / bw, min_b_h / bh)
@@ -368,12 +432,35 @@ def place_barcode_on_canvas(
     new_h = min(canvas_h, max(1, int(round(bh * scale))))
     b = b.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
  
-    max_mx = int(round(max_margin_ratio * new_w))
-    max_my = int(round(max_margin_ratio * new_h))
- 
-    left_margin = random.randint(0, min(max_mx, max(0, canvas_w - new_w)))
-    top_margin = random.randint(0, min(max_my, max(0, canvas_h - new_h)))
- 
+    max_mx = int(round(margin_ratio * new_w))
+    max_my = int(round(margin_ratio * new_h))
+
+    extra_x = max(0, canvas_w - new_w)
+    extra_y = max(0, canvas_h - new_h)
+
+    # Keep BOTH sides within margin_ratio (previous logic could make the opposite side very large).
+    def _sample_pair(extra: int, max_each: int) -> Tuple[int, int]:
+        if extra <= 0:
+            return (0, 0)
+        max_each = min(max_each, extra)
+        a = random.randint(0, max_each)
+        b = random.randint(0, max_each)
+        s = a + b
+        if s <= extra:
+            return (a, b)
+        if s == 0:
+            return (0, extra)
+        scale = extra / s
+        a2 = int(round(a * scale))
+        a2 = max(0, min(a2, max_each))
+        b2 = extra - a2
+        b2 = max(0, min(b2, max_each))
+        a2 = extra - b2
+        return (a2, b2)
+
+    left_margin, right_margin = _sample_pair(extra_x, max_mx)
+    top_margin, bottom_margin = _sample_pair(extra_y, max_my)
+
     x0 = left_margin
     y0 = top_margin
     x1 = x0 + new_w
@@ -386,7 +473,57 @@ def place_barcode_on_canvas(
         y0 = max(0, (canvas_h - new_h) // 2)
         y1 = y0 + new_h
  
-    bg.paste(b, (x0, y0))
+    patch = bg.crop((x0, y0, x1, y1)).convert("RGB")
+
+    patch_np = np.asarray(patch).astype(np.int16)
+    h, w = patch_np.shape[:2]
+    n = np.random.normal(0.0, 1.0, size=(h, w)).astype(np.float32)
+    n = cv2.GaussianBlur(n, (0, 0), sigmaX=random.uniform(8.0, 22.0))
+    amp = random.uniform(4.0, 18.0)
+    patch_np = patch_np + (n[:, :, None] * amp).astype(np.int16)
+
+    if random.random() < 0.75:
+        target = np.array(
+            [random.randint(220, 255), random.randint(220, 255), random.randint(220, 255)],
+            dtype=np.int16,
+        )
+        alpha = random.uniform(0.15, 0.55)
+        patch_np = (patch_np * (1.0 - alpha) + target[None, None, :] * alpha).astype(np.int16)
+
+    gx = np.linspace(-1.0, 1.0, w, dtype=np.float32)
+    gy = np.linspace(-1.0, 1.0, h, dtype=np.float32)
+    g = (gy[:, None] * random.uniform(-0.12, 0.12) + gx[None, :] * random.uniform(-0.12, 0.12))
+    patch_np = patch_np + (g[:, :, None] * random.uniform(10.0, 28.0)).astype(np.int16)
+
+    patch_np = np.clip(patch_np, 0, 255).astype(np.uint8)
+    patch = Image.fromarray(patch_np, mode="RGB")
+
+    bars = b.convert("L")
+    bars_np = np.asarray(bars)
+    mask_np = (bars_np < random.randint(170, 215)).astype(np.uint8) * 255
+    mask = Image.fromarray(mask_np, mode="L")
+    if random.random() < 0.35:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 0.9)))
+
+    ink = (
+        random.randint(0, 45),
+        random.randint(0, 45),
+        random.randint(0, 45),
+    )
+
+    if random.random() < 0.7:
+        shadow_mask = mask.filter(ImageFilter.GaussianBlur(radius=random.uniform(1.2, 3.2)))
+        shadow = Image.new("RGBA", patch.size, (0, 0, 0, 0))
+        sx = random.randint(-3, 4)
+        sy = random.randint(-2, 4)
+        alpha = random.randint(40, 130)
+        shadow.paste((0, 0, 0, alpha), (sx, sy), shadow_mask)
+        patch_rgba = patch.convert("RGBA")
+        patch = Image.alpha_composite(patch_rgba, shadow).convert("RGB")
+
+    ink_layer = Image.new("RGB", patch.size, ink)
+    patch.paste(ink_layer, (0, 0), mask)
+    bg.paste(patch, (x0, y0))
     return bg, (x0, y0, x1, y1)
  
  
@@ -527,7 +664,12 @@ def generate_split(
     seed: int,
     size_min: int,
     size_max: int,
+    min_margin_ratio: float,
     max_margin_ratio: float,
+    bg_white_prob: float,
+    quiet_zone_min_ratio: float,
+    quiet_zone_max_ratio: float,
+    quiet_zone_tight_crop_prob: float,
     landscape_prob: float,
     aspect_min: float,
     aspect_max: float,
@@ -547,6 +689,12 @@ def generate_split(
         for i in tqdm(range(n), desc=f"{split}"):
             spec = _make_sample(min_len=min_len, max_len=max_len)
             barcode_img = _render_code128_raw(spec.codewords)
+            barcode_img = vary_quiet_zone(
+                barcode_img,
+                min_pad_ratio=quiet_zone_min_ratio,
+                max_pad_ratio=quiet_zone_max_ratio,
+                tight_crop_prob=quiet_zone_tight_crop_prob,
+            )
  
             canvas_size = _sample_size(
                 size_min=size_min,
@@ -556,16 +704,24 @@ def generate_split(
                 aspect_max=aspect_max,
             )
  
+            margin_ratio = random.uniform(min_margin_ratio, max_margin_ratio)
             composed, bbox = place_barcode_on_canvas(
                 barcode_img=barcode_img,
                 canvas_size=canvas_size,
-                max_margin_ratio=max_margin_ratio,
+                margin_ratio=margin_ratio,
+                bg_white_prob=bg_white_prob,
             )
  
             final_img = apply_pipeline(composed, bbox=bbox)
  
-            filename = f"{split}_{i:07d}.png"
-            final_img.save(images_dir / filename, format="PNG", optimize=True)
+            filename = f"{split}_{i:07d}.jpg"
+            final_img.convert("RGB").save(
+                images_dir / filename,
+                format="JPEG",
+                quality=90,
+                subsampling=0,
+                optimize=False,
+            )
  
             value = _codewords_to_pua(spec.codewords)
             writer.writerow(
@@ -589,7 +745,12 @@ def main() -> None:
  
     ap.add_argument("--size-min", type=int, default=256)
     ap.add_argument("--size-max", type=int, default=640)
-    ap.add_argument("--max-margin-ratio", type=float, default=0.25)
+    ap.add_argument("--min-margin-ratio", type=float, default=0.02)
+    ap.add_argument("--max-margin-ratio", type=float, default=0.20)
+    ap.add_argument("--bg-white-prob", type=float, default=0.55)
+    ap.add_argument("--quiet-zone-min-ratio", type=float, default=0.02)
+    ap.add_argument("--quiet-zone-max-ratio", type=float, default=0.10)
+    ap.add_argument("--quiet-zone-tight-crop-prob", type=float, default=0.18)
     ap.add_argument("--landscape-prob", type=float, default=0.7)
     ap.add_argument("--aspect-min", type=float, default=1.2)
     ap.add_argument("--aspect-max", type=float, default=3.2)
@@ -609,7 +770,12 @@ def main() -> None:
         seed=int(args.seed),
         size_min=int(args.size_min),
         size_max=int(args.size_max),
+        min_margin_ratio=float(args.min_margin_ratio),
         max_margin_ratio=float(args.max_margin_ratio),
+        bg_white_prob=float(args.bg_white_prob),
+        quiet_zone_min_ratio=float(args.quiet_zone_min_ratio),
+        quiet_zone_max_ratio=float(args.quiet_zone_max_ratio),
+        quiet_zone_tight_crop_prob=float(args.quiet_zone_tight_crop_prob),
         landscape_prob=float(args.landscape_prob),
         aspect_min=float(args.aspect_min),
         aspect_max=float(args.aspect_max),
@@ -623,7 +789,12 @@ def main() -> None:
         seed=int(args.seed) + 1,
         size_min=int(args.size_min),
         size_max=int(args.size_max),
+        min_margin_ratio=float(args.min_margin_ratio),
         max_margin_ratio=float(args.max_margin_ratio),
+        bg_white_prob=float(args.bg_white_prob),
+        quiet_zone_min_ratio=float(args.quiet_zone_min_ratio),
+        quiet_zone_max_ratio=float(args.quiet_zone_max_ratio),
+        quiet_zone_tight_crop_prob=float(args.quiet_zone_tight_crop_prob),
         landscape_prob=float(args.landscape_prob),
         aspect_min=float(args.aspect_min),
         aspect_max=float(args.aspect_max),
@@ -637,7 +808,12 @@ def main() -> None:
         seed=int(args.seed) + 2,
         size_min=int(args.size_min),
         size_max=int(args.size_max),
+        min_margin_ratio=float(args.min_margin_ratio),
         max_margin_ratio=float(args.max_margin_ratio),
+        bg_white_prob=float(args.bg_white_prob),
+        quiet_zone_min_ratio=float(args.quiet_zone_min_ratio),
+        quiet_zone_max_ratio=float(args.quiet_zone_max_ratio),
+        quiet_zone_tight_crop_prob=float(args.quiet_zone_tight_crop_prob),
         landscape_prob=float(args.landscape_prob),
         aspect_min=float(args.aspect_min),
         aspect_max=float(args.aspect_max),
