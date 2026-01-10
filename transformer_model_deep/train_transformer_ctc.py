@@ -81,6 +81,7 @@ def main() -> None:
 
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--log-interval", type=int, default=100)
+    ap.add_argument("--sync-timing", action="store_true")
 
     ap.add_argument("--tb", action="store_true")
     ap.add_argument("--tb-logdir", type=str, default="runs/barcode-transformer-ctc")
@@ -350,7 +351,7 @@ def main() -> None:
             train_loss += loss.item()
             if args.log_interval > 0 and i % args.log_interval == 0:
                 lr = float(optimizer.param_groups[0]["lr"]) if len(optimizer.param_groups) > 0 else float("nan")
-                if device.type == "cuda":
+                if bool(args.sync_timing) and device.type == "cuda":
                     torch.cuda.synchronize(device)
                 dt = max(1e-9, time.perf_counter() - step_t0)
                 imgs_per_sec = float(xb.size(0)) / dt
@@ -363,7 +364,6 @@ def main() -> None:
                     writer.add_scalar("LR/Train", lr, global_step)
                     writer.add_scalar("Throughput/Train_ImgsPerSec", imgs_per_sec, global_step)
                     writer.add_scalar("Throughput/Train_MsPerStep", dt * 1000.0, global_step)
-                    writer.flush()
 
                 if args.mlflow:
                     mlflow.log_metric("lr", lr, step=global_step)
