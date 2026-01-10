@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple, Optional
@@ -62,12 +65,17 @@ class BarcodeCtcDataset(Dataset):
         height: int,
         augment: bool = False,
         augment_prob: float = 0.9,
+        cache_dir: Optional[Path] = None,
     ) -> None:
         self.samples = list(samples)
         self.char2idx = char2idx
         self.height = int(height)
         self.augment = bool(augment)
         self.augment_prob = float(augment_prob)
+
+        self.cache_dir: Optional[Path] = Path(cache_dir).expanduser().resolve() if cache_dir else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._aug = None
         if self.augment:
@@ -142,17 +150,46 @@ class BarcodeCtcDataset(Dataset):
             if cv2 is None:
                 raise RuntimeError("cv2 is required for image loading")
 
-            bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
-            if bgr is None:
-                raise FileNotFoundError(f"Failed to read image: {path}")
+            bgr = None
+            if self.cache_dir is not None:
+                key = f"{str(path)}|h={self.height}"
+                digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+                cache_path = self.cache_dir / f"{digest}.npy"
+                if cache_path.exists():
+                    bgr = np.load(str(cache_path))
+                else:
+                    src = cv2.imread(str(path), cv2.IMREAD_COLOR)
+                    if src is None:
+                        raise FileNotFoundError(f"Failed to read image: {path}")
 
-            h, w = bgr.shape[:2]
-            scale = self.height / float(h)
-            new_w = max(1, int(round(w * scale)))
+                    h, w = src.shape[:2]
+                    scale = self.height / float(h)
+                    new_w = max(1, int(round(w * scale)))
+                    interp = cv2.INTER_AREA if new_w < w else cv2.INTER_LINEAR
+                    bgr = cv2.resize(src, (new_w, self.height), interpolation=interp)
 
-            # Use INTER_AREA for downscale, INTER_LINEAR for upscale
-            interp = cv2.INTER_AREA if new_w < w else cv2.INTER_LINEAR
-            bgr = cv2.resize(bgr, (new_w, self.height), interpolation=interp)
+                    tmp_dir = str(self.cache_dir)
+                    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".npy", dir=tmp_dir)
+                    os.close(fd)
+                    try:
+                        np.save(tmp_path, bgr)
+                        os.replace(tmp_path, cache_path)
+                    finally:
+                        if os.path.exists(tmp_path):
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+            else:
+                bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+                if bgr is None:
+                    raise FileNotFoundError(f"Failed to read image: {path}")
+
+                h, w = bgr.shape[:2]
+                scale = self.height / float(h)
+                new_w = max(1, int(round(w * scale)))
+                interp = cv2.INTER_AREA if new_w < w else cv2.INTER_LINEAR
+                bgr = cv2.resize(bgr, (new_w, self.height), interpolation=interp)
 
             if self._aug is not None and np.random.rand() < self.augment_prob:
                 out = self._aug(image=bgr)

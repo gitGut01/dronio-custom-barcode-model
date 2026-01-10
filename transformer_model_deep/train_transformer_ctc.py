@@ -73,6 +73,8 @@ def main() -> None:
 
     ap.add_argument("--num-workers", type=int, default=2)
 
+    ap.add_argument("--cache-dir", type=str, default="")
+
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--aug-prob", type=float, default=0.9)
 
@@ -136,8 +138,15 @@ def main() -> None:
         args.height,
         augment=bool(args.aug),
         augment_prob=float(args.aug_prob),
+        cache_dir=(Path(args.cache_dir) if args.cache_dir else None),
     )
-    val_ds = BarcodeCtcDataset(val_samples, char2idx, args.height, augment=False)
+    val_ds = BarcodeCtcDataset(
+        val_samples,
+        char2idx,
+        args.height,
+        augment=False,
+        cache_dir=(Path(args.cache_dir) if args.cache_dir else None),
+    )
 
     train_loader = DataLoader(
         train_ds,
