@@ -4,6 +4,7 @@ import argparse
 import os
 import time
 from pathlib import Path
+from typing import Iterable, List, Sequence
 
 import torch
 import torch.nn as nn
@@ -46,6 +47,81 @@ def _cer(pred: str, target: str) -> tuple[int, int]:
     return _edit_distance(pred, target), len(target)
 
 
+def _estimate_resized_width(path: Path, target_h: int) -> int:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            w, h = im.size
+        if h <= 0:
+            return 1
+        scale = float(target_h) / float(h)
+        return max(1, int(round(float(w) * scale)))
+    except Exception:
+        return 1
+
+
+class _BucketBatchSampler:
+    def __init__(
+        self,
+        widths: Sequence[int],
+        batch_size: int,
+        shuffle: bool,
+        bucket_size: int,
+        drop_last: bool = False,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if bucket_size <= 0:
+            raise ValueError("bucket_size must be positive")
+        if len(widths) == 0:
+            raise ValueError("widths must be non-empty")
+
+        self.widths = list(int(w) for w in widths)
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.bucket_size = int(bucket_size)
+        self.drop_last = bool(drop_last)
+
+    def __iter__(self) -> Iterable[List[int]]:
+        n = len(self.widths)
+        indices = list(range(n))
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+            perm = torch.randperm(n, generator=g).tolist()
+            indices = [indices[i] for i in perm]
+
+        chunks: List[List[int]] = []
+        for i in range(0, n, self.bucket_size):
+            chunk = indices[i : i + self.bucket_size]
+            chunk.sort(key=lambda j: self.widths[j])
+            chunks.append(chunk)
+
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+            perm_chunks = torch.randperm(len(chunks), generator=g).tolist()
+            chunks = [chunks[i] for i in perm_chunks]
+
+        batch: List[int] = []
+        for chunk in chunks:
+            for idx in chunk:
+                batch.append(idx)
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+
+        if batch and not self.drop_last:
+            yield batch
+
+    def __len__(self) -> int:
+        n = len(self.widths)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="my_dataset")
@@ -73,7 +149,8 @@ def main() -> None:
 
     ap.add_argument("--num-workers", type=int, default=2)
 
-    ap.add_argument("--cache-dir", type=str, default="")
+    ap.add_argument("--bucket", action="store_true")
+    ap.add_argument("--bucket-size", type=int, default=4096)
 
     ap.add_argument("--aug", action="store_true")
     ap.add_argument("--aug-prob", type=float, default=0.9)
@@ -138,23 +215,38 @@ def main() -> None:
         args.height,
         augment=bool(args.aug),
         augment_prob=float(args.aug_prob),
-        cache_dir=(Path(args.cache_dir) if args.cache_dir else None),
     )
     val_ds = BarcodeCtcDataset(
         val_samples,
         char2idx,
         args.height,
         augment=False,
-        cache_dir=(Path(args.cache_dir) if args.cache_dir else None),
     )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch,
-        shuffle=True,
-        **loader_kwargs,
-        collate_fn=ctc_collate,
-    )
+    if bool(args.bucket):
+        print("--- Building width buckets for training ---")
+        train_widths = [_estimate_resized_width(s.image_path, int(args.height)) for s in train_ds.samples]
+        train_sampler = _BucketBatchSampler(
+            widths=train_widths,
+            batch_size=int(args.batch),
+            shuffle=True,
+            bucket_size=int(args.bucket_size),
+            drop_last=False,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=train_sampler,
+            **loader_kwargs,
+            collate_fn=ctc_collate,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch,
+            shuffle=True,
+            **loader_kwargs,
+            collate_fn=ctc_collate,
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch,
@@ -334,7 +426,8 @@ def main() -> None:
         t0 = time.time()
         train_loss = 0.0
 
-        step_t0 = time.perf_counter()
+        log_t0 = time.perf_counter()
+        last_log_i = -1
 
         for i, (xb, x_w_lens, y_concat, y_lens, _, _) in enumerate(train_loader):
             xb = xb.to(device, non_blocking=True)
@@ -362,24 +455,27 @@ def main() -> None:
                 lr = float(optimizer.param_groups[0]["lr"]) if len(optimizer.param_groups) > 0 else float("nan")
                 if bool(args.sync_timing) and device.type == "cuda":
                     torch.cuda.synchronize(device)
-                dt = max(1e-9, time.perf_counter() - step_t0)
-                imgs_per_sec = float(xb.size(0)) / dt
+                dt = max(1e-9, time.perf_counter() - log_t0)
+                steps = max(1, i - last_log_i)
+                imgs_per_sec = (float(xb.size(0)) * float(steps)) / dt
+                ms_per_step = (dt / float(steps)) * 1000.0
                 print(
                     f"Epoch {epoch} [{i}/{len(train_loader)}] Loss: {loss.item():.4f} | "
-                    f"LR: {lr:.6g} | {imgs_per_sec:.1f} img/s | {dt*1000.0:.1f} ms/step"
+                    f"LR: {lr:.6g} | {imgs_per_sec:.1f} img/s | {ms_per_step:.1f} ms/step"
                 )
 
                 if writer:
                     writer.add_scalar("LR/Train", lr, global_step)
                     writer.add_scalar("Throughput/Train_ImgsPerSec", imgs_per_sec, global_step)
-                    writer.add_scalar("Throughput/Train_MsPerStep", dt * 1000.0, global_step)
+                    writer.add_scalar("Throughput/Train_MsPerStep", ms_per_step, global_step)
 
                 if args.mlflow:
                     mlflow.log_metric("lr", lr, step=global_step)
                     mlflow.log_metric("train_imgs_per_sec", imgs_per_sec, step=global_step)
-                    mlflow.log_metric("train_ms_per_step", dt * 1000.0, step=global_step)
+                    mlflow.log_metric("train_ms_per_step", ms_per_step, step=global_step)
 
-                step_t0 = time.perf_counter()
+                log_t0 = time.perf_counter()
+                last_log_i = i
 
         model.eval()
         val_loss = 0.0
